@@ -31,6 +31,16 @@ from pypdf import PdfReader, PdfWriter
 from researchos.obsidian import ObsidianWatcher, PageConflictStore
 
 
+LINT_CHECKS = (
+    "contradictions",
+    "stale claims",
+    "orphan pages",
+    "missing cross-references",
+    "possible duplicates",
+    "evidence gaps",
+)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime dependencies configured at the application boundary."""
@@ -803,6 +813,108 @@ class IngestWorkerService:
                     break
 
 
+class LintJobStore:
+    """Durable state for an explicitly requested wiki-lint run."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self.path = data_dir / "runtime" / "wiki-lint-job.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = Lock()
+
+    def job(self) -> dict[str, Any] | None:
+        with self.lock:
+            if not self.path.exists():
+                return None
+            try:
+                job = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            return job if isinstance(job, dict) else None
+
+    def save(self, job: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            temporary = self.path.with_suffix(".pending")
+            temporary.write_text(json.dumps(job, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(self.path)
+            return dict(job)
+
+
+class WikiLintWorker:
+    """Runs one researcher-requested maintenance job; it never self-schedules."""
+
+    def __init__(self, jobs: LintJobStore, publisher: "AtomicWikiPublisher") -> None:
+        self.jobs = jobs
+        self.publisher = publisher
+        self.lock = Lock()
+
+    def queue(self) -> dict[str, Any]:
+        current = self.jobs.job()
+        if current and current.get("status") in {"queued", "processing"}:
+            raise ValueError("Wiki lint is already queued or processing.")
+        return self.jobs.save(
+            {
+                "status": "queued",
+                "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
+
+    def run_next(self) -> dict[str, Any] | None:
+        if not self.lock.acquire(blocking=False):
+            raise RuntimeError("Wiki lint is already processing.")
+        try:
+            job = self.jobs.job()
+            if job is None or job.get("status") != "queued":
+                return job
+            job["status"] = "processing"
+            job["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            self.jobs.save(job)
+            try:
+                result = self.publisher.publish_lint()
+                job["checks"] = result["checks"]
+                job["findings"] = result["findings"]
+                job["status"] = "completed"
+                job.pop("error", None)
+            except (CodexProtocolError, PublicationRejected) as error:
+                job["status"] = "failed"
+                job["error"] = str(error) or "Wiki lint could not publish its repair."
+            job["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return self.jobs.save(job)
+        finally:
+            self.lock.release()
+
+
+class WikiLintService:
+    """Event-driven executor for researcher-started lint; no periodic maintenance."""
+
+    def __init__(self, worker: WikiLintWorker) -> None:
+        self.worker = worker
+        self.wake = Event()
+        self.stopping = Event()
+        self.thread = Thread(target=self._run, daemon=True, name="researchos-wiki-lint")
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        self.wake.set()
+        self.thread.join(timeout=1)
+
+    def schedule(self) -> None:
+        self.wake.set()
+
+    def _run(self) -> None:
+        while not self.stopping.is_set():
+            self.wake.wait()
+            self.wake.clear()
+            if self.stopping.is_set():
+                return
+            try:
+                self.worker.run_next()
+            except RuntimeError:
+                continue
+
+
 class CodexProtocolError(Exception):
     pass
 
@@ -832,6 +944,16 @@ class CodexWorker:
 
         return self._run(
             "file-analysis",
+            str(request_path),
+            network_disabled=True,
+            writable_directory=request_path.parent,
+        )
+
+    def lint(self, request_path: Path) -> dict[str, Any]:
+        """Run explicit, offline wiki maintenance against a staged vault only."""
+
+        return self._run(
+            "lint",
             str(request_path),
             network_disabled=True,
             writable_directory=request_path.parent,
@@ -1396,6 +1518,164 @@ class AtomicWikiPublisher:
                 shutil.rmtree(stage)
             raise
         return analysis_path
+
+    def publish_lint(self) -> dict[str, Any]:
+        """Publish one researcher-requested, fully validated maintenance update."""
+
+        checks = list(LINT_CHECKS)
+        evidence: list[dict[str, str]] = []
+        for source_id in self._published_derivative_source_ids():
+            source = self.sources.source(source_id)
+            job = self.sources.job(source_id)
+            derivative = job.get("derivative") if job else None
+            if (
+                source is None
+                or source.get("withdrawal", {}).get("status") == "withdrawn"
+                or not isinstance(derivative, str)
+            ):
+                continue
+            evidence.append(
+                {
+                    "source_id": source_id,
+                    "title": self._effective_metadata(source)["title"],
+                    "derivative_path": str(self.sources.source_dir.parent / derivative),
+                }
+            )
+        if not evidence:
+            raise PublicationRejected("Wiki lint requires at least one published ingested source.")
+
+        base_head = self._head(self.vault)
+        stage = self._copy_fixed_snapshot()
+        try:
+            skill_path = stage / ".researchos-llm-wiki.md"
+            skill_path.write_text(self._lint_skill(), encoding="utf-8")
+            request_path = stage / ".researchos-lint.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "operation": "lint",
+                        "staged_vault": str(stage),
+                        "ingested_evidence": evidence,
+                        "checks": checks,
+                        "skill_path": str(skill_path),
+                        "required_skill": "LLM Wiki",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            response = self.codex.lint(request_path)
+            request_path.unlink(missing_ok=True)
+            skill_path.unlink(missing_ok=True)
+            result = self._lint_result(response.get("output"), checks)
+            self._validate_lint(stage, result["checks"])
+            self._commit(stage, "wiki", operation="wiki lint")
+            self._rebase_revalidate_and_publish(
+                stage,
+                base_head,
+                lambda: self._validate_lint(stage, result["checks"]),
+            )
+            return result
+        except Exception:
+            if stage.exists():
+                shutil.rmtree(stage)
+            raise
+
+    @staticmethod
+    def _lint_skill() -> str:
+        path = Path(__file__).parents[1] / ".agents" / "skills" / "llm-wiki" / "SKILL.md"
+        try:
+            skill = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise PublicationRejected("The repository-versioned LLM Wiki skill is unavailable.") from error
+        if "## Lint workflow" not in skill:
+            raise PublicationRejected("The repository-versioned LLM Wiki skill has no lint workflow.")
+        return skill
+
+    @staticmethod
+    def _lint_result(output: Any, expected: list[str]) -> dict[str, Any]:
+        try:
+            result = json.loads(output) if isinstance(output, str) else None
+        except json.JSONDecodeError as error:
+            raise PublicationRejected("Codex returned an invalid wiki-lint result.") from error
+        checks = result.get("checks") if isinstance(result, dict) else None
+        if checks != expected:
+            raise PublicationRejected("Codex did not inspect every required wiki-lint check.")
+        findings = result.get("findings") if isinstance(result, dict) else None
+        if not isinstance(findings, dict) or set(findings) != set(expected):
+            raise PublicationRejected("Codex did not return findings for every wiki-lint check.")
+        if any(
+            not isinstance(finding, dict)
+            or finding.get("status") not in {"no-issues", "repaired"}
+            for finding in findings.values()
+        ):
+            raise PublicationRejected("Codex returned invalid wiki-lint findings.")
+        return {"checks": checks, "findings": findings}
+
+    def _validate_lint(self, stage: Path, checks: list[str]) -> None:
+        self._validate_annotations(stage)
+        self._validate_historical_citations(stage)
+        self._validate_possible_duplicates(stage)
+        citation_pages = self._citation_pages_for_source_ids(
+            self._published_derivative_source_ids()
+        )
+        paper_pages = list((stage / self.page_prefix).glob("*.md"))
+        topic_pages = list((stage / self.topic_prefix).glob("*.md"))
+        analysis_pages = list((stage / "analyses").glob("*.md"))
+        pages = [*paper_pages, *topic_pages, *analysis_pages]
+        for page_path in paper_pages:
+            self._validate_page(page_path, citation_pages, required_source=None)
+        for page_path in topic_pages:
+            self._validate_topic_page(page_path, citation_pages)
+        for page_path in analysis_pages:
+            self._validate_existing_filed_analysis_page(page_path, citation_pages)
+        self._validate_wikilinks(stage, pages)
+        self._run_git(stage, "add", "--all")
+        changed_pages = [
+            stage / name
+            for name in self._changed_paths(stage)
+            if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/", "analyses/"))
+            and name.endswith(".md")
+        ]
+        if not changed_pages:
+            raise PublicationRejected("Wiki lint found no repairable wiki update to publish.")
+        index = (stage / "index.md").read_text(encoding="utf-8")
+        latest_entry = re.split(
+            r"\n(?=## \[)", (stage / "log.md").read_text(encoding="utf-8")
+        )[-1]
+        if "wiki lint" not in latest_entry.casefold():
+            raise PublicationRejected("The activity log does not describe the wiki lint.")
+        if "Checks: " + ", ".join(checks) not in latest_entry:
+            raise PublicationRejected("The activity log omits completed wiki-lint checks.")
+        for changed_page in changed_pages:
+            link = f"[[{changed_page.relative_to(stage).with_suffix('').as_posix()}]]"
+            if link not in index:
+                raise PublicationRejected("The content index does not list a lint-repaired page.")
+            if link not in latest_entry:
+                raise PublicationRejected("The activity log does not describe a lint-repaired page.")
+        tracked_names = self._run_git(stage, "ls-files")
+        prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
+        if any(part in tracked_names.lower() for part in prohibited):
+            raise PublicationRejected("Source artifacts cannot enter wiki Git history.")
+
+    def _validate_possible_duplicates(self, stage: Path) -> None:
+        """Lint may flag uncertainty, but cannot silently resolve it."""
+
+        if not self.vault.exists():
+            return
+        for old_page in self._wiki_pages(self.vault):
+            staged_page = stage / old_page.relative_to(self.vault)
+            if not staged_page.exists():
+                continue
+            old_duplicates = set(
+                re.findall(r"^  - (topics/[^\s]+)$", old_page.read_text(encoding="utf-8"), re.MULTILINE)
+            )
+            staged_duplicates = set(
+                re.findall(r"^  - (topics/[^\s]+)$", staged_page.read_text(encoding="utf-8"), re.MULTILINE)
+            )
+            if old_duplicates - staged_duplicates:
+                raise PublicationRejected("The staged lint removed a possible duplicate.")
 
     def _apply_metadata_correction(
         self, stage: Path, source_id: str, metadata: dict[str, Any]
@@ -2955,6 +3235,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     publisher.recover_pending_withdrawals()
     ingest_worker = IngestWorker(sources, settings, publisher)
     ingest_service = IngestWorkerService(ingest_worker)
+    lint_jobs = LintJobStore(settings.data_dir)
+    lint_worker = WikiLintWorker(lint_jobs, publisher)
+    lint_service = WikiLintService(lint_worker)
     obsidian_watcher = ObsidianWatcher(publisher.vault, conflicts)
     research_service = ResearchService(state, sources, worker, publisher.vault)
     app = FastAPI(title="ResearchOS Local MVP")
@@ -2969,12 +3252,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         obsidian_watcher.start()
         if settings.run_ingest_service:
             ingest_service.start()
+            lint_service.start()
 
     @app.on_event("shutdown")
     def stop_ingest_service() -> None:
         obsidian_watcher.stop()
         if settings.run_ingest_service:
             ingest_service.stop()
+            lint_service.stop()
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> HTMLResponse:
@@ -3191,6 +3476,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ingest_service.schedule()
         return {"job": job}
 
+    @app.post("/api/wiki/lint", status_code=status.HTTP_202_ACCEPTED)
+    def start_wiki_lint() -> dict[str, Any]:
+        try:
+            job = lint_worker.queue()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        if settings.run_ingest_service:
+            lint_service.schedule()
+        return {"job": job}
+
+    @app.get("/api/wiki/lint")
+    def wiki_lint_status() -> dict[str, Any]:
+        return {"job": lint_jobs.job()}
+
+    @app.post("/api/wiki/lint/run")
+    def run_wiki_lint() -> dict[str, Any]:
+        try:
+            job = lint_worker.run_next()
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"job": job}
+
     @app.post("/library/ingests/{source_id}/retry")
     def retry_ingest_from_library(source_id: str) -> RedirectResponse:
         try:
@@ -3341,11 +3648,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for item in items
             ) + "</ul>"
 
+        lint_job = lint_jobs.job()
+        lint_status = (
+            escape(str(lint_job.get("status", "unknown"))) if lint_job else "not run"
+        )
+        lint_detail = (
+            f" <small>{escape(str(lint_job['error']))}</small>"
+            if lint_job and isinstance(lint_job.get("error"), str)
+            else ""
+        )
         return page(
             "Wiki",
             """<form action="/wiki/search" method="get"><label>Search published wiki
 <input name="q" type="search" required></label><button>Search</button></form>
 <p><a href="/wiki/index">Browse the index</a> · <a href="/wiki/activity">Read activity</a></p>
+<section><h2>Wiki lint</h2><p>Researcher-triggered maintenance status: <strong>"""
+            + lint_status
+            + "</strong>"
+            + lint_detail
+            + """</p><form action="/wiki/lint" method="post"><button>Start Wiki lint</button></form></section>
 <section><h2>Paper pages</h2>"""
             + page_list(grouped["paper"])
             + "</section><section><h2>Topic pages</h2>"
@@ -3357,6 +3678,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 else ""
             ),
         )
+
+    @app.post("/wiki/lint")
+    def start_wiki_lint_from_page() -> RedirectResponse:
+        start_wiki_lint()
+        return RedirectResponse("/wiki", status_code=303)
 
     @app.get("/wiki/search", response_class=HTMLResponse)
     def search_wiki(q: str = "") -> HTMLResponse:

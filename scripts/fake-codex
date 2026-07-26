@@ -224,6 +224,113 @@ The supporting papers contribute distinct evidence that should remain explicitly
     return 0
 
 
+def lint(request_path: str, mode: str) -> int:
+    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "disabled":
+        print("wiki-lint writer networking was not disabled", file=sys.stderr)
+        return 78
+    request = json.loads(open(request_path, encoding="utf-8").read())
+    vault = os.path.abspath(request["staged_vault"])
+    if not os.path.abspath(request_path).startswith(vault):
+        print("invalid staged lint request", file=sys.stderr)
+        return 79
+    checks = request.get("checks")
+    expected_checks = [
+        "contradictions",
+        "stale claims",
+        "orphan pages",
+        "missing cross-references",
+        "possible duplicates",
+        "evidence gaps",
+    ]
+    if checks != expected_checks:
+        print("lint request omitted a required check", file=sys.stderr)
+        return 80
+    skill_path = request.get("skill_path")
+    if not isinstance(skill_path, str) or not os.path.abspath(skill_path).startswith(vault):
+        print("lint request did not stage the versioned skill", file=sys.stderr)
+        return 84
+    if "## Lint workflow" not in open(skill_path, encoding="utf-8").read():
+        print("staged skill has no lint workflow", file=sys.stderr)
+        return 85
+    evidence = request.get("ingested_evidence", [])
+    for source in evidence:
+        open(source["derivative_path"], encoding="utf-8").read()
+    detected_missing_cross_reference = any(
+        "missing cross reference" in open(source["derivative_path"], encoding="utf-8").read().casefold()
+        for source in evidence
+    )
+    if mode == "lint-network":
+        try:
+            socket.create_connection(("198.51.100.1", 9), timeout=0.1)
+        except OSError:
+            pass
+        else:
+            print("lint writer unexpectedly reached the network", file=sys.stderr)
+            return 81
+    topic_directory = os.path.join(vault, "topics")
+    paper_directory = os.path.join(vault, "papers")
+    topic_names = sorted(
+        name for name in os.listdir(topic_directory) if name.endswith(".md")
+    ) if os.path.exists(topic_directory) else []
+    if topic_names:
+        relative_path = f"topics/{topic_names[0]}"
+    else:
+        paper_names = sorted(
+            name for name in os.listdir(paper_directory) if name.endswith(".md")
+        )
+        relative_path = f"papers/{paper_names[0]}"
+    page_path = os.path.join(vault, relative_path)
+    contents = open(page_path, encoding="utf-8").read()
+    citation = re.search(r"\[\^([^]]+)\]: .+? — source [0-9a-f]{64} — PDF p\. \d+", contents)
+    if citation is None:
+        print("lint target has no evidence citation", file=sys.stderr)
+        return 82
+    repair = (
+        "\n## Lint maintenance\n"
+        "Lint verified the page's cited evidence while preserving competing claims, "
+        "possible duplicates, and open questions. "
+        f"[^{citation.group(1)}]\n"
+    )
+    contents = contents.replace("\n## Evidence citations\n", repair + "\n## Evidence citations\n", 1)
+    if detected_missing_cross_reference:
+        related_heading = "## Related evidence\n" if "## Related evidence\n" in contents else "## Related pages\n"
+        contents = contents.replace(
+            related_heading,
+            related_heading + f"[[index|ResearchOS index]] [^{citation.group(1)}]\n",
+            1,
+        )
+    open(page_path, "w", encoding="utf-8").write(contents)
+    if mode == "lint-annotation":
+        contents = open(page_path, encoding="utf-8").read()
+        open(page_path, "w", encoding="utf-8").write(
+            contents.replace(
+                "<!-- researcher-annotations:start -->\n",
+                "<!-- researcher-annotations:start -->\nunauthorized lint edit\n",
+            )
+        )
+    with open(os.path.join(vault, "index.md"), "a", encoding="utf-8") as index:
+        index.write(f"\n## Wiki lint\n- [[{relative_path[:-3]}]] — maintenance checked\n")
+    with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
+        log.write(
+            "\n## [2026-07-26] wiki lint | researcher-triggered maintenance\n"
+            f"Affected pages: [[{relative_path[:-3]}]]\n"
+            "Contradictions: preserved\nPossible duplicates: preserved\n"
+            f"Checks: {', '.join(checks)}\nOutcome: published\n"
+        )
+    if mode == "lint-failure":
+        print("controlled staged lint failure", file=sys.stderr)
+        return 83
+    findings = {check: {"status": "no-issues"} for check in checks}
+    findings["stale claims"] = {"status": "repaired", "affected_pages": [relative_path[:-3]]}
+    if detected_missing_cross_reference:
+        findings["missing cross-references"] = {
+            "status": "repaired", "affected_pages": [relative_path[:-3]],
+        }
+    print(json.dumps({"type": "progress", "message": "Checking staged wiki health"}))
+    print(json.dumps({"type": "result", "output": json.dumps({"checks": checks, "findings": findings})}))
+    return 0
+
+
 def main() -> int:
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
     if mode == "failure":
@@ -232,7 +339,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "annotation-ambiguous", "annotation-trailing-newline", "wait-for-concurrent-commit", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "withdrawn-hidden", "file-invalid", "file-annotation", "file-corrupt-existing"}:
+    if mode not in {"success", "invalid", "annotation", "annotation-ambiguous", "annotation-trailing-newline", "wait-for-concurrent-commit", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "withdrawn-hidden", "file-invalid", "file-annotation", "file-corrupt-existing", "lint-annotation", "lint-network", "lint-failure"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
@@ -243,6 +350,8 @@ def main() -> int:
         return research(sys.argv[2], mode)
     if len(sys.argv) == 3 and sys.argv[1] == "file-analysis":
         return file_analysis(sys.argv[2], mode)
+    if len(sys.argv) == 3 and sys.argv[1] == "lint":
+        return lint(sys.argv[2], mode)
     if len(sys.argv) != 3 or sys.argv[1] != "ingest":
         print("unsupported fake Codex command", file=sys.stderr)
         return 64
