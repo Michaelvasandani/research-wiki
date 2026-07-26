@@ -23,6 +23,62 @@ def outcome_direction(text: str) -> str | None:
     return None
 
 
+def research(request_path: str, mode: str) -> int:
+    if os.environ.get("RESEARCHOS_CHAT_ACCESS") != "readonly":
+        print("research worker was not read-only", file=sys.stderr)
+        return 70
+    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "disabled":
+        print("lab-only research unexpectedly received network access", file=sys.stderr)
+        return 71
+    request = json.loads(open(request_path, encoding="utf-8").read())
+    vault = os.path.abspath(request["published_vault"])
+    index_path = request.get("index_path")
+    if index_path and os.path.exists(index_path):
+        open(index_path, encoding="utf-8").read()
+    for page in request.get("pages", []):
+        open(page["file"], encoding="utf-8").read()
+    source_ids: list[str] = []
+    for derivative in request.get("derivatives", []):
+        open(derivative["path"], encoding="utf-8").read()
+        source_ids.append(derivative["source_id"])
+    if mode == "prompt-write":
+        try:
+            open(os.path.join(vault, "injected.md"), "w", encoding="utf-8").write("no")
+        except OSError:
+            pass
+        subprocess.run(
+            ["git", "-C", vault, "commit", "--allow-empty", "-m", "prompt write"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if len(source_ids) >= 2:
+        answer = (
+            "The published lab evidence supports a cross-paper synthesis: the papers "
+            "report complementary or contrasting findings that should remain separately cited. "
+            f"Evidence: {source_ids[0]} and {source_ids[1]}."
+        )
+    elif source_ids:
+        answer = f"The published lab evidence is currently limited to source {source_ids[0]}."
+    else:
+        answer = "No published lab evidence is available yet."
+    # Deliberately not suitable for the UI: the application must map worker status
+    # to concise public states rather than expose implementation details.
+    print(json.dumps({"type": "progress", "message": "raw shell command: rg --hidden vault"}))
+    print(json.dumps({"type": "answer", "content": "Synthesizing the published lab evidence. "}))
+    print(
+        json.dumps(
+            {
+                "type": "result",
+                "output": json.dumps({"answer": answer, "lab_source_ids": source_ids}),
+            }
+        )
+    )
+    if mode == "result-failure":
+        return 72
+    return 0
+
+
 def main() -> int:
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
     if mode == "failure":
@@ -31,13 +87,15 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
         print(json.dumps({"type": "progress", "message": "Checking the local worker"}))
         print(json.dumps({"type": "result", "output": "fake Codex is ready"}))
         return 0
+    if len(sys.argv) == 3 and sys.argv[1] == "research":
+        return research(sys.argv[2], mode)
     if len(sys.argv) != 3 or sys.argv[1] != "ingest":
         print("unsupported fake Codex command", file=sys.stderr)
         return 64

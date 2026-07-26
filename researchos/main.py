@@ -9,7 +9,7 @@ import json
 from multiprocessing import get_context
 import os
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 import re
 import shlex
 import shutil
@@ -18,12 +18,12 @@ import sys
 import tempfile
 from threading import Event, Lock, Thread
 import time
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from markitdown import MarkItDown
 from pypdf import PdfReader, PdfWriter
@@ -63,20 +63,37 @@ class FileState:
         self.path = data_dir / "runtime" / "research-thread.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def messages(self) -> list[str]:
+    def messages(self) -> list[dict[str, str]]:
         if not self.path.exists():
             return []
         data = json.loads(self.path.read_text(encoding="utf-8"))
         messages = data.get("messages", [])
-        if not isinstance(messages, list) or not all(
-            isinstance(message, str) for message in messages
+        if not isinstance(messages, list):
+            raise ValueError("The persisted research thread is invalid.")
+        # Preserve the original shell ticket's simple string transcript when an
+        # existing Local MVP is upgraded in place.
+        if all(isinstance(message, str) for message in messages):
+            return [{"role": "user", "content": message} for message in messages]
+        if not all(
+            isinstance(message, dict)
+            and message.get("role") in {"user", "assistant"}
+            and isinstance(message.get("content"), str)
+            for message in messages
         ):
             raise ValueError("The persisted research thread is invalid.")
-        return messages
+        return [
+            {"role": message["role"], "content": message["content"]}
+            for message in messages
+        ]
 
-    def append_message(self, message: str) -> None:
+    def append_exchange(self, message: str, answer: str) -> None:
         messages = self.messages()
-        messages.append(message)
+        messages.extend(
+            [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": answer},
+            ]
+        )
         self._write({"messages": messages})
 
     def _write(self, content: dict[str, Any]) -> None:
@@ -690,12 +707,116 @@ class CodexWorker:
             writable_directory=request_path.parent,
         )
 
+    def research(self, request_path: Path) -> dict[str, Any]:
+        """Run chat with a read-only view of one published wiki snapshot."""
+
+        events = list(self.stream_research(request_path))
+        output = next((event["output"] for event in events if event["type"] == "result"), None)
+        if output is None:
+            raise CodexProtocolError("Codex returned malformed protocol output.")
+        return {
+            "events": [
+                {"type": "progress", "message": event["message"]}
+                for event in events
+                if event["type"] == "progress"
+            ],
+            "output": output,
+        }
+
+    def stream_research(self, request_path: Path) -> Iterator[dict[str, str]]:
+        """Read the public worker protocol incrementally without exposing it to UI callers."""
+
+        environment = os.environ.copy()
+        environment.update(self.environment)
+        environment.update(
+            {
+                "RESEARCHOS_CHAT_ACCESS": "readonly",
+                "RESEARCHOS_NETWORK_ACCESS": "disabled",
+                "HTTP_PROXY": "",
+                "HTTPS_PROXY": "",
+                "ALL_PROXY": "",
+                "NO_PROXY": "*",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        command = self._sandboxed_reader_command([*self.command, "research", str(request_path)])
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                text=True,
+            )
+        except FileNotFoundError as error:
+            raise CodexProtocolError("Codex executable was not found.") from error
+        assert process.stdout is not None
+        lines: Queue[str | None] = Queue()
+
+        def collect_stdout() -> None:
+            for line in process.stdout:
+                lines.put(line)
+            lines.put(None)
+
+        Thread(target=collect_stdout, daemon=True, name="researchos-chat-output").start()
+        deadline = time.monotonic() + 15
+        result_output: str | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise CodexProtocolError("Codex did not respond before the timeout.")
+            try:
+                line = lines.get(timeout=remaining)
+            except Empty as error:
+                process.kill()
+                process.wait()
+                raise CodexProtocolError("Codex did not respond before the timeout.") from error
+            if line is None:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                process.kill()
+                raise CodexProtocolError("Codex returned malformed protocol output.") from error
+            if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+                process.kill()
+                raise CodexProtocolError("Codex returned malformed protocol output.")
+            if event["type"] == "progress" and isinstance(event.get("message"), str):
+                yield {"type": "progress", "message": event["message"]}
+            elif event["type"] == "answer" and isinstance(event.get("content"), str):
+                yield {"type": "answer", "content": event["content"]}
+            elif event["type"] == "result" and isinstance(event.get("output"), str):
+                if result_output is not None:
+                    process.kill()
+                    raise CodexProtocolError("Codex returned malformed protocol output.")
+                # A result is only public after a clean worker exit. This prevents
+                # a process from leaking or persisting a plausible final answer and
+                # then failing its post-processing step.
+                result_output = event["output"]
+            else:
+                process.kill()
+                raise CodexProtocolError("Codex returned malformed protocol output.")
+        try:
+            return_code = process.wait(timeout=max(deadline - time.monotonic(), 0))
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            raise CodexProtocolError("Codex did not respond before the timeout.") from error
+        if return_code:
+            raise CodexProtocolError(f"Codex exited with status {return_code}.")
+        if result_output is None:
+            raise CodexProtocolError("Codex returned malformed protocol output.")
+        yield {"type": "result", "output": result_output}
+
     def _run(
         self,
         operation: str,
         *arguments: str,
         network_disabled: bool = False,
         writable_directory: Path | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         environment = os.environ.copy()
         environment.update(self.environment)
@@ -714,11 +835,28 @@ class CodexWorker:
                     "PYTHONDONTWRITEBYTECODE": "1",
                 }
             )
+        if read_only:
+            # Unlike a staged writer, research may eventually use the web, but it
+            # never receives a writable filesystem. The application owns only the
+            # transcript state after a completed response.
+            environment.update(
+                {
+                    "RESEARCHOS_CHAT_ACCESS": "readonly",
+                    "RESEARCHOS_NETWORK_ACCESS": "disabled",
+                    "HTTP_PROXY": "",
+                    "HTTPS_PROXY": "",
+                    "ALL_PROXY": "",
+                    "NO_PROXY": "*",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
         command = [*self.command, operation, *arguments]
         if network_disabled:
             if writable_directory is None:
                 raise CodexProtocolError("The writer sandbox needs a staged vault.")
             command = self._sandboxed_writer_command(command, writable_directory)
+        elif read_only:
+            command = self._sandboxed_reader_command(command)
         try:
             result = subprocess.run(
                 command,
@@ -806,6 +944,41 @@ class CodexWorker:
         raise CodexProtocolError(
             "No supported OS sandbox is available for the network-disabled writer."
         )
+
+    @staticmethod
+    def _sandboxed_reader_command(command: list[str]) -> list[str]:
+        """Allow a chat worker to inspect data, but never alter it or run Git writes."""
+
+        sandbox = Path("/usr/bin/sandbox-exec")
+        if sys.platform == "darwin" and sandbox.exists():
+            profile = "(version 1) (deny default) (allow process*) (allow file-read*) (deny network*)"
+            return [str(sandbox), "-p", profile, "--", *command]
+        bubblewrap = shutil.which("bwrap")
+        if sys.platform.startswith("linux") and bubblewrap:
+            return [
+                bubblewrap,
+                "--die-with-parent",
+                "--unshare-user",
+                "--unshare-net",
+                "--unshare-pid",
+                "--new-session",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                *command,
+            ]
+        raise CodexProtocolError("No supported OS sandbox is available for read-only research.")
 
 
 class PublicationRejected(Exception):
@@ -1758,6 +1931,171 @@ def search_excerpt(markdown: str, query: str) -> str:
     return ("…" if start else "") + compact[start:end] + ("…" if end < len(compact) else "")
 
 
+class ResearchService:
+    """Query one immutable published snapshot without granting wiki write access."""
+
+    def __init__(self, state: FileState, sources: SourceCatalog, worker: CodexWorker, vault: Path) -> None:
+        self.state = state
+        self.sources = sources
+        self.worker = worker
+        self.vault = vault
+        self.runtime_dir = state.path.parent
+
+    def ask(self, message: str) -> str:
+        answer: str | None = None
+        for event in self.stream(message):
+            if event["type"] == "complete":
+                answer = event["content"]
+        if answer is None:
+            raise CodexProtocolError("Codex returned an invalid research response.")
+        return answer
+
+    def stream(self, message: str) -> Iterator[dict[str, str]]:
+        """Yield only safe application states while the worker is still running."""
+
+        request, published_sources = self._request(message)
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=self.runtime_dir, delete=False
+        ) as temporary_file:
+            json.dump(request, temporary_file, sort_keys=True)
+            temporary_file.write("\n")
+            request_path = Path(temporary_file.name)
+        try:
+            for event in self.worker.stream_research(request_path):
+                if event["type"] == "progress":
+                    # The worker's progress string could contain shell/tool details.
+                    # Expose a stable public state instead.
+                    yield {"type": "progress", "message": "Searching lab sources"}
+                    continue
+                if event["type"] == "answer":
+                    yield {"type": "answer", "content": event["content"]}
+                    continue
+                answer, cited_ids = self._parse_result(event, set(published_sources))
+                lab_sources = [
+                    source
+                    for source_id, source in published_sources.items()
+                    if source_id in cited_ids
+                ]
+                rendered = self._render_answer(answer, lab_sources, request["pending_sources"])
+                self.state.append_exchange(message, rendered)
+                yield {"type": "complete", "content": rendered}
+        finally:
+            request_path.unlink(missing_ok=True)
+
+    def _request(self, message: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        published = PublishedWiki(self.vault)
+        source_records = self.sources.sources()
+        published_sources = self._snapshot_sources(published)
+        request = {
+            "operation": "research",
+            "message": message,
+            "thread": self.state.messages(),
+            # The resolved target freezes this turn to one fully published revision,
+            # even if an ingest swaps the public vault symlink while chat runs.
+            "published_vault": str(published.vault.resolve()),
+            "index_path": str(published.vault / "index.md"),
+            "pages": [
+                {
+                    "path": page.path,
+                    "file": str(published.vault / f"{page.path}.md"),
+                    "links": sorted(extract_wikilinks(page.body)),
+                    "backlinks": sorted(backlink.path for backlink in published.backlinks(page)),
+                }
+                for page in published.pages
+            ],
+            "derivatives": [
+                {
+                    "source_id": source_id,
+                    "path": source["derivative"],
+                }
+                for source_id, source in published_sources.items()
+            ],
+            "pending_sources": [
+                {
+                    "source_id": source["source_id"],
+                    "name": source["filenames"][0],
+                    "status": source["job"]["status"],
+                }
+                for source in source_records
+                if source["source_id"] not in published_sources
+                and source["job"].get("status") in {"queued", "processing"}
+            ],
+            "required_skill": "LLM Wiki query",
+        }
+        return request, published_sources
+
+    def _snapshot_sources(self, published: PublishedWiki) -> dict[str, dict[str, str]]:
+        """Resolve evidence from the same immutable vault revision as its wiki pages."""
+
+        sources: dict[str, dict[str, str]] = {}
+        for page in published.pages:
+            supporting_sources = page.metadata.get("supporting_sources")
+            if not isinstance(supporting_sources, list):
+                continue
+            for source_id in supporting_sources:
+                if not isinstance(source_id, str) or not re.fullmatch(r"[0-9a-f]{64}", source_id):
+                    continue
+                derivative = self._latest_derivative(source_id)
+                if derivative is None:
+                    # A page without its immutable derivative is not usable lab
+                    # evidence; it is safer to report a gap than combine revisions.
+                    continue
+                title = page.title if page.page_type == "paper" else source_id
+                sources.setdefault(
+                    source_id,
+                    {"source_id": source_id, "title": title, "derivative": str(derivative)},
+                )
+        return sources
+
+    def _latest_derivative(self, source_id: str) -> Path | None:
+        candidates = sorted(
+            (self.sources.source_dir.parent / "derivatives" / source_id).glob("*/derivative.md")
+        )
+        return candidates[-1] if candidates else None
+
+    @staticmethod
+    def _parse_result(result: dict[str, Any], published_source_ids: set[str]) -> tuple[str, set[str]]:
+        try:
+            payload = json.loads(result["output"])
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise CodexProtocolError("Codex returned an invalid research response.") from error
+        answer = payload.get("answer") if isinstance(payload, dict) else None
+        citations = payload.get("lab_source_ids") if isinstance(payload, dict) else None
+        if (
+            not isinstance(answer, str)
+            or not answer.strip()
+            or not isinstance(citations, list)
+            or not all(isinstance(source_id, str) for source_id in citations)
+        ):
+            raise CodexProtocolError("Codex returned an invalid research response.")
+        cited_ids = set(citations)
+        if not cited_ids <= published_source_ids:
+            raise CodexProtocolError("Codex cited a source outside the published lab snapshot.")
+        return answer.strip(), cited_ids
+
+    @staticmethod
+    def _render_answer(
+        answer: str, lab_sources: list[dict[str, str]], pending_sources: list[dict[str, str]]
+    ) -> str:
+        evidence = "\n".join(
+            f"- {source['title']} — "
+            f"source {source['source_id']} — /wiki/papers/{source['source_id']}"
+            for source in lab_sources
+        ) or "- No published lab sources supported this answer."
+        pending = "\n".join(
+            f"- {source['name']} is still {source['status']} and is not yet available."
+            for source in pending_sources
+        ) or "- All uploaded sources are either published or unavailable."
+        return f"{answer}\n\n## Lab sources\n{evidence}\n\n## Source availability\n{pending}"
+
+
+def server_sent_event(name: str, payload: dict[str, str]) -> str:
+    """Serialize only the small public event vocabulary, never worker internals."""
+
+    return f"event: {name}\ndata: {json.dumps(payload, sort_keys=True)}\n\n"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
     state = FileState(settings.data_dir)
@@ -1766,6 +2104,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     publisher = AtomicWikiPublisher(sources, settings)
     ingest_worker = IngestWorker(sources, settings, publisher)
     ingest_service = IngestWorkerService(ingest_worker)
+    research_service = ResearchService(state, sources, worker, publisher.vault)
     app = FastAPI(title="ResearchOS Local MVP")
     app.mount(
         "/assets",
@@ -1953,12 +2292,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/research", response_class=HTMLResponse)
     def research() -> HTMLResponse:
-        messages = "".join(f"<li>{escape(message)}</li>" for message in state.messages())
+        messages = "".join(
+            f"<li><strong>{escape(message['role'].title())}:</strong> "
+            f"{escape(message['content'])}</li>"
+            for message in state.messages()
+        )
         transcript = f"<ul>{messages}</ul>" if messages else "<p>No saved research messages.</p>"
         return page(
             "Research",
-            f"""<p>The single persisted research thread is ready.</p>{transcript}
-<form action="/research/messages" method="post"><label>Message <input name="message" required></label><button>Save message</button></form>""",
+            f"""<p>The single persisted research thread reads the latest published lab wiki.</p>{transcript}
+<p id="research-status" aria-live="polite"></p>
+<form id="research-form" action="/research/messages" method="post"><label>Message <input name="message" required></label><button>Ask research</button></form>
+<script>
+(() => {{
+  const form = document.querySelector("#research-form");
+  const status = document.querySelector("#research-status");
+  form.addEventListener("submit", async event => {{
+    event.preventDefault();
+    const message = new FormData(form).get("message");
+    status.textContent = "Searching lab sources";
+    const response = await fetch("/api/research/messages", {{
+      method: "POST", headers: {{"Content-Type": "application/json"}}, body: JSON.stringify({{message}})
+    }});
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    let answer = "";
+    while (true) {{
+      const next = await reader.read();
+      if (next.done) break;
+      pending += decoder.decode(next.value, {{stream: true}});
+      const events = pending.split("\\n\\n");
+      pending = events.pop();
+      for (const eventText of events) {{
+        const event = eventText.match(/^event: (.+)$/m)?.[1];
+        const data = eventText.match(/^data: (.+)$/m)?.[1];
+        if (!event || !data) continue;
+        const payload = JSON.parse(data);
+        if (event === "progress") status.textContent = payload.message;
+        if (event === "answer") {{ answer += payload.content; status.textContent = answer; }}
+        if (event === "complete") {{ answer = payload.content; status.textContent = answer; }}
+        if (event === "error") status.textContent = payload.message;
+      }}
+    }}
+    if (answer) window.location.reload();
+  }});
+}})();
+</script>""",
         )
 
     @app.post("/research/messages")
@@ -1966,8 +2346,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         clean_message = message.strip()
         if not clean_message:
             raise HTTPException(status_code=422, detail="A research message is required.")
-        state.append_message(clean_message)
+        try:
+            research_service.ask(clean_message)
+        except CodexProtocolError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
         return RedirectResponse("/research", status_code=303)
+
+    @app.get("/api/research/thread")
+    def research_thread() -> dict[str, list[dict[str, str]]]:
+        return {"messages": state.messages()}
+
+    @app.post("/api/research/messages")
+    def stream_research_message(payload: dict[str, Any]) -> StreamingResponse:
+        message = payload.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise HTTPException(status_code=422, detail="A research message is required.")
+
+        def stream() -> Iterator[str]:
+            # These are intentionally application-owned summaries. Worker progress,
+            # shell output, tool calls, and private reasoning never cross this seam.
+            yield server_sent_event("progress", {"message": "Searching lab sources"})
+            try:
+                for event in research_service.stream(message.strip()):
+                    if event["type"] == "progress":
+                        yield server_sent_event("progress", {"message": event["message"]})
+                    elif event["type"] == "answer":
+                        yield server_sent_event("answer", {"content": event["content"]})
+                    else:
+                        yield server_sent_event("complete", {"content": event["content"]})
+            except CodexProtocolError:
+                yield server_sent_event(
+                    "error", {"message": "Research could not complete. Please try again."}
+                )
+                return
+            yield server_sent_event("progress", {"message": "Preparing cited response"})
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
 
     @app.get("/wiki", response_class=HTMLResponse)
     def wiki() -> HTMLResponse:
