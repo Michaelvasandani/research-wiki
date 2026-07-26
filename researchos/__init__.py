@@ -1,0 +1,1 @@
+"""ResearchOS local MVP application."""

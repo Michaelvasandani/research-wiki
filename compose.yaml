@@ -1,0 +1,10 @@
+services:
+  researchos:
+    build: .
+    ports:
+      - "127.0.0.1:${RESEARCHOS_PORT:-8000}:8000"
+    volumes:
+      - ${RESEARCHOS_DATA_HOST_DIR:-./data}:/data
+    environment:
+      RESEARCHOS_DATA_DIR: /data
+      CODEX_COMMAND: ${CODEX_COMMAND:-/app/scripts/fake-codex}

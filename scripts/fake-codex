@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Deterministic stand-in for Codex CLI integration tests.
+
+Set FAKE_CODEX_MODE to success, malformed, or failure. The success protocol uses
+JSON Lines so callers can observe a progress event before a completed result.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+
+def main() -> int:
+    mode = os.environ.get("FAKE_CODEX_MODE", "success")
+    if len(sys.argv) != 2 or sys.argv[1] != "probe":
+        print("unsupported fake Codex command", file=sys.stderr)
+        return 64
+    if mode == "failure":
+        print("controlled fake failure", file=sys.stderr)
+        return 17
+    if mode == "malformed":
+        print("not-json")
+        return 0
+    if mode != "success":
+        print("unsupported fake Codex mode", file=sys.stderr)
+        return 64
+    print(json.dumps({"type": "progress", "message": "Checking the local worker"}))
+    print(json.dumps({"type": "result", "output": "fake Codex is ready"}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
