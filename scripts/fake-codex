@@ -27,8 +27,8 @@ def research(request_path: str, mode: str) -> int:
     if os.environ.get("RESEARCHOS_CHAT_ACCESS") != "readonly":
         print("research worker was not read-only", file=sys.stderr)
         return 70
-    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "disabled":
-        print("lab-only research unexpectedly received network access", file=sys.stderr)
+    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "enabled":
+        print("research chat did not receive its live-web capability", file=sys.stderr)
         return 71
     request = json.loads(open(request_path, encoding="utf-8").read())
     vault = os.path.abspath(request["published_vault"])
@@ -65,12 +65,41 @@ def research(request_path: str, mode: str) -> int:
     # Deliberately not suitable for the UI: the application must map worker status
     # to concise public states rather than expose implementation details.
     print(json.dumps({"type": "progress", "message": "raw shell command: rg --hidden vault"}))
+    if mode == "web":
+        answer = (
+            "The lab evidence establishes the starting point, while the external "
+            "follow-up supplies the missing later evidence."
+        )
+        print(
+            json.dumps(
+                {
+                    "type": "progress",
+                    "scope": "external",
+                    "message": "raw web tool invocation: search follow-up evidence",
+                }
+            )
+        )
     print(json.dumps({"type": "answer", "content": "Synthesizing the published lab evidence. "}))
+    output = {"answer": answer, "lab_source_ids": source_ids}
+    if mode == "web":
+        output.update(
+            {
+                "lab_evidence_gap": (
+                    "The lab collection has no follow-up evidence for the later outcome."
+                ),
+                "external_sources": [
+                    {
+                        "title": "External follow-up study",
+                        "url": "https://example.test/follow-up-study",
+                    }
+                ],
+            }
+        )
     print(
         json.dumps(
             {
                 "type": "result",
-                "output": json.dumps({"answer": answer, "lab_source_ids": source_ids}),
+                "output": json.dumps(output),
             }
         )
     )
@@ -87,7 +116,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:

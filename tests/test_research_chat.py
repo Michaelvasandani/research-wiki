@@ -107,6 +107,12 @@ def test_research_prompt_cannot_write_or_commit_the_published_vault(tmp_path: Pa
             for path in vault.rglob("*")
             if path.is_file() and ".git" not in path.parts
         }
+        before_evidence = {
+            path.relative_to(tmp_path): path.read_bytes()
+            for root in (tmp_path / "sources", tmp_path / "derivatives")
+            for path in root.rglob("*")
+            if path.is_file()
+        }
 
         response = client.post(
             "/api/research/messages",
@@ -127,6 +133,12 @@ def test_research_prompt_cannot_write_or_commit_the_published_vault(tmp_path: Pa
         for path in vault.rglob("*")
         if path.is_file() and ".git" not in path.parts
     } == before_files
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for root in (tmp_path / "sources", tmp_path / "derivatives")
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before_evidence
 
 
 def test_research_does_not_persist_a_result_from_a_failed_worker(tmp_path: Path) -> None:
@@ -141,3 +153,62 @@ def test_research_does_not_persist_a_result_from_a_failed_worker(tmp_path: Path)
     assert "event: error" in response.text
     assert "event: complete" not in response.text
     assert thread.json() == {"messages": []}
+
+
+def test_research_can_extend_insufficient_lab_evidence_with_separate_web_sources(
+    tmp_path: Path,
+) -> None:
+    with make_client(tmp_path, fake_mode="web") as client:
+        source_id, title = publish(
+            client, "lab-method.pdf", "The lab method has a higher outcome."
+        )
+        vault = tmp_path / "vault"
+        before_head = subprocess.run(
+            ["git", "-C", str(vault), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        before_files = {
+            path.relative_to(vault): path.read_bytes()
+            for path in vault.rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        }
+        before_evidence = {
+            path.relative_to(tmp_path): path.read_bytes()
+            for root in (tmp_path / "sources", tmp_path / "derivatives")
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+        response = client.post(
+            "/api/research/messages",
+            json={"message": "What later evidence addresses the gap in my lab paper?"},
+        )
+
+    assert response.status_code == 200
+    assert "Searching external sources" in response.text
+    assert "## Evidence gap in lab collection" in response.text
+    assert "The lab collection has no follow-up evidence" in response.text
+    assert "## Lab sources" in response.text
+    assert source_id in response.text and title in response.text
+    assert "## External sources" in response.text
+    assert "External follow-up study" in response.text
+    assert "https://example.test/follow-up-study" in response.text
+    assert subprocess.run(
+        ["git", "-C", str(vault), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == before_head
+    assert {
+        path.relative_to(vault): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    } == before_files
+    assert {
+        path.relative_to(tmp_path): path.read_bytes()
+        for root in (tmp_path / "sources", tmp_path / "derivatives")
+        for path in root.rglob("*")
+        if path.is_file()
+    } == before_evidence

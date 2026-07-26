@@ -731,7 +731,10 @@ class CodexWorker:
         environment.update(
             {
                 "RESEARCHOS_CHAT_ACCESS": "readonly",
-                "RESEARCHOS_NETWORK_ACCESS": "disabled",
+                # Chat alone may use live web research to fill a named gap in the
+                # published lab evidence. It remains filesystem-read-only; ingest
+                # and every staged writer still use the network-disabled sandbox.
+                "RESEARCHOS_NETWORK_ACCESS": "enabled",
                 "HTTP_PROXY": "",
                 "HTTPS_PROXY": "",
                 "ALL_PROXY": "",
@@ -739,7 +742,9 @@ class CodexWorker:
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
-        command = self._sandboxed_reader_command([*self.command, "research", str(request_path)])
+        command = self._sandboxed_web_reader_command(
+            [*self.command, "research", str(request_path)]
+        )
         try:
             process = subprocess.Popen(
                 command,
@@ -784,7 +789,11 @@ class CodexWorker:
                 process.kill()
                 raise CodexProtocolError("Codex returned malformed protocol output.")
             if event["type"] == "progress" and isinstance(event.get("message"), str):
-                yield {"type": "progress", "message": event["message"]}
+                scope = event.get("scope", "lab")
+                if scope not in {"lab", "external"}:
+                    process.kill()
+                    raise CodexProtocolError("Codex returned malformed protocol output.")
+                yield {"type": "progress", "message": event["message"], "scope": scope}
             elif event["type"] == "answer" and isinstance(event.get("content"), str):
                 yield {"type": "answer", "content": event["content"]}
             elif event["type"] == "result" and isinstance(event.get("output"), str):
@@ -979,6 +988,43 @@ class CodexWorker:
                 *command,
             ]
         raise CodexProtocolError("No supported OS sandbox is available for read-only research.")
+
+    @staticmethod
+    def _sandboxed_web_reader_command(command: list[str]) -> list[str]:
+        """Give read-only research chat network access without a writeable vault."""
+
+        sandbox = Path("/usr/bin/sandbox-exec")
+        if sys.platform == "darwin" and sandbox.exists():
+            profile = "(version 1) (deny default) (allow process*) (allow file-read*) (allow network*)"
+            return [str(sandbox), "-p", profile, "--", *command]
+        bubblewrap = shutil.which("bwrap")
+        if sys.platform.startswith("linux") and bubblewrap:
+            # The filesystem remains read-only. Unlike an ingest writer, chat does
+            # not enter a network namespace because live external research is a
+            # deliberate capability of this one process boundary.
+            return [
+                bubblewrap,
+                "--die-with-parent",
+                "--unshare-user",
+                "--unshare-pid",
+                "--new-session",
+                "--uid",
+                "0",
+                "--gid",
+                "0",
+                "--cap-drop",
+                "ALL",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--",
+                *command,
+            ]
+        raise CodexProtocolError("No supported OS sandbox is available for web research.")
 
 
 class PublicationRejected(Exception):
@@ -1965,19 +2011,33 @@ class ResearchService:
             for event in self.worker.stream_research(request_path):
                 if event["type"] == "progress":
                     # The worker's progress string could contain shell/tool details.
-                    # Expose a stable public state instead.
-                    yield {"type": "progress", "message": "Searching lab sources"}
+                    # Expose a stable public state instead. The worker may declare
+                    # only the bounded evidence scope, never arbitrary UI text.
+                    progress_message = (
+                        "Searching external sources"
+                        if event.get("scope") == "external"
+                        else "Searching lab sources"
+                    )
+                    yield {"type": "progress", "message": progress_message}
                     continue
                 if event["type"] == "answer":
                     yield {"type": "answer", "content": event["content"]}
                     continue
-                answer, cited_ids = self._parse_result(event, set(published_sources))
+                answer, cited_ids, gap, external_sources = self._parse_result(
+                    event, set(published_sources)
+                )
                 lab_sources = [
                     source
                     for source_id, source in published_sources.items()
                     if source_id in cited_ids
                 ]
-                rendered = self._render_answer(answer, lab_sources, request["pending_sources"])
+                rendered = self._render_answer(
+                    answer,
+                    lab_sources,
+                    external_sources,
+                    gap,
+                    request["pending_sources"],
+                )
                 self.state.append_exchange(message, rendered)
                 yield {"type": "complete", "content": rendered}
         finally:
@@ -2022,6 +2082,12 @@ class ResearchService:
                 and source["job"].get("status") in {"queued", "processing"}
             ],
             "required_skill": "LLM Wiki query",
+            "external_research_policy": (
+                "Use live web research only when the published lab evidence is "
+                "insufficient. Name the lab-evidence gap and return external "
+                "citations separately. Never write external results into the vault "
+                "or source storage."
+            ),
         }
         return request, published_sources
 
@@ -2055,7 +2121,9 @@ class ResearchService:
         return candidates[-1] if candidates else None
 
     @staticmethod
-    def _parse_result(result: dict[str, Any], published_source_ids: set[str]) -> tuple[str, set[str]]:
+    def _parse_result(
+        result: dict[str, Any], published_source_ids: set[str]
+    ) -> tuple[str, set[str], str | None, list[dict[str, str]]]:
         try:
             payload = json.loads(result["output"])
         except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -2072,11 +2140,41 @@ class ResearchService:
         cited_ids = set(citations)
         if not cited_ids <= published_source_ids:
             raise CodexProtocolError("Codex cited a source outside the published lab snapshot.")
-        return answer.strip(), cited_ids
+        external = payload.get("external_sources", [])
+        gap = payload.get("lab_evidence_gap")
+        if not isinstance(external, list):
+            raise CodexProtocolError("Codex returned an invalid research response.")
+        external_sources: list[dict[str, str]] = []
+        for source in external:
+            if not isinstance(source, dict):
+                raise CodexProtocolError("Codex returned an invalid research response.")
+            title = source.get("title")
+            url = source.get("url")
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or not isinstance(url, str)
+                or not re.fullmatch(r"https?://[^\s]+", url)
+            ):
+                raise CodexProtocolError("Codex returned an invalid research response.")
+            external_sources.append({"title": title.strip(), "url": url})
+        if external_sources:
+            if not isinstance(gap, str) or not gap.strip():
+                raise CodexProtocolError(
+                    "Codex used external research without naming the lab evidence gap."
+                )
+            return answer.strip(), cited_ids, gap.strip(), external_sources
+        if gap is not None:
+            raise CodexProtocolError("Codex returned an invalid research response.")
+        return answer.strip(), cited_ids, None, []
 
     @staticmethod
     def _render_answer(
-        answer: str, lab_sources: list[dict[str, str]], pending_sources: list[dict[str, str]]
+        answer: str,
+        lab_sources: list[dict[str, str]],
+        external_sources: list[dict[str, str]],
+        gap: str | None,
+        pending_sources: list[dict[str, str]],
     ) -> str:
         evidence = "\n".join(
             f"- {source['title']} — "
@@ -2087,7 +2185,19 @@ class ResearchService:
             f"- {source['name']} is still {source['status']} and is not yet available."
             for source in pending_sources
         ) or "- All uploaded sources are either published or unavailable."
-        return f"{answer}\n\n## Lab sources\n{evidence}\n\n## Source availability\n{pending}"
+        external_evidence = "\n".join(
+            f"- {source['title']} — {source['url']}" for source in external_sources
+        )
+        external_sections = (
+            f"\n\n## Evidence gap in lab collection\n{gap}"
+            f"\n\n## External sources\n{external_evidence}"
+            if external_sources and gap is not None
+            else ""
+        )
+        return (
+            f"{answer}\n\n## Lab sources\n{evidence}{external_sections}"
+            f"\n\n## Source availability\n{pending}"
+        )
 
 
 def server_sent_event(name: str, payload: dict[str, str]) -> str:
@@ -2300,7 +2410,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         transcript = f"<ul>{messages}</ul>" if messages else "<p>No saved research messages.</p>"
         return page(
             "Research",
-            f"""<p>The single persisted research thread reads the latest published lab wiki.</p>{transcript}
+            f"""<p>The single persisted research thread reads the latest published lab wiki and may use separately labelled external research when the lab collection has a gap.</p>{transcript}
 <p id="research-status" aria-live="polite"></p>
 <form id="research-form" action="/research/messages" method="post"><label>Message <input name="message" required></label><button>Ask research</button></form>
 <script>
