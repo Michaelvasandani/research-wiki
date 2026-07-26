@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from markitdown import MarkItDown
 from pypdf import PdfReader, PdfWriter
 
@@ -1093,7 +1094,7 @@ def page(title: str, content: str) -> HTMLResponse:
     return HTMLResponse(
         f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{escape(title)} · ResearchOS</title>
-<style>body{{font-family:system-ui,sans-serif;margin:0;color:#17212b;background:#f7f8fa}}header{{background:#132b3a;color:#fff;padding:1rem 2rem}}nav a{{color:#dff4f0;margin-right:1rem}}main{{max-width:56rem;margin:2rem auto;background:#fff;padding:2rem;border-radius:.5rem;box-shadow:0 1px 4px #ccd}}</style>
+<style>body{{font-family:system-ui,sans-serif;margin:0;color:#17212b;background:#f7f8fa}}header{{background:#132b3a;color:#fff;padding:1rem 2rem}}nav a{{color:#dff4f0;margin-right:1rem}}main{{max-width:56rem;margin:2rem auto;background:#fff;padding:2rem;border-radius:.5rem;box-shadow:0 1px 4px #ccd}}.graph-shell{{position:relative;border:1px solid #d7e0e6;border-radius:.5rem;background:#fbfdff;overflow:hidden}}#knowledge-graph{{display:block;width:100%;min-height:30rem;cursor:grab}}#knowledge-graph:active{{cursor:grabbing}}#graph-tooltip,#graph-validation{{min-height:1.5rem;padding:.5rem 1rem;color:#3d5160}}.graph-key{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin:0 .3rem 0 1rem}}</style>
 </head><body><header><strong>ResearchOS</strong><nav aria-label="Primary">{navigation}</nav></header><main><h1>{escape(title)}</h1>{content}</main></body></html>"""
     )
 
@@ -1183,6 +1184,63 @@ class PublishedWiki:
         if not candidate or any(part in {"", ".", ".."} for part in candidate.split("/")):
             return ""
         return candidate
+
+
+GRAPH_TYPES = (
+    ("paper", "Paper", "#2d6a9f"),
+    ("topic", "Topic", "#3d8b67"),
+    ("filed-analysis", "Filed analysis", "#9b5b8f"),
+)
+GRAPH_COLORS = {page_type: color for page_type, _, color in GRAPH_TYPES}
+DEFAULT_GRAPH_COLOR = "#6c757d"
+
+
+def graph_data(published: PublishedWiki) -> dict[str, list[dict[str, Any]]]:
+    """Project one published wiki snapshot into its explicit-link graph."""
+
+    node_ids = {
+        wiki_page.path: (
+            wiki_page.metadata["id"]
+            if isinstance(wiki_page.metadata.get("id"), str)
+            and wiki_page.metadata["id"]
+            else wiki_page.path
+        )
+        for wiki_page in published.pages
+    }
+    connections = {page_id: 0 for page_id in node_ids.values()}
+    edges: list[dict[str, str]] = []
+    validation: list[dict[str, str]] = []
+
+    for source_page in published.pages:
+        source_id = node_ids[source_page.path]
+        for target_path in sorted(extract_wikilinks(source_page.body)):
+            target_page = published.link_target(target_path)
+            if target_page is None:
+                validation.append(
+                    {
+                        "source": source_id,
+                        "target": target_path,
+                        "message": "Explicit wikilink target is not a published wiki page.",
+                    }
+                )
+                continue
+            target_id = node_ids[target_page.path]
+            edges.append({"source": source_id, "target": target_id})
+            connections[source_id] += 1
+            connections[target_id] += 1
+
+    nodes = [
+        {
+            "id": node_ids[wiki_page.path],
+            "title": wiki_page.title,
+            "type": wiki_page.page_type,
+            "target": wiki_href(wiki_page.path),
+            "connections": connections[node_ids[wiki_page.path]],
+            "color": GRAPH_COLORS.get(wiki_page.page_type, DEFAULT_GRAPH_COLOR),
+        }
+        for wiki_page in published.pages
+    ]
+    return {"nodes": nodes, "edges": edges, "validation": validation}
 
 
 def parse_frontmatter(contents: str) -> tuple[dict[str, str | list[str]], str]:
@@ -1364,6 +1422,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ingest_worker = IngestWorker(sources, settings, publisher)
     ingest_service = IngestWorkerService(ingest_worker)
     app = FastAPI(title="ResearchOS Local MVP")
+    app.mount(
+        "/assets",
+        StaticFiles(directory=Path(__file__).parent / "static"),
+        name="assets",
+    )
 
     @app.on_event("startup")
     def start_ingest_service() -> None:
@@ -1581,7 +1644,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/graph", response_class=HTMLResponse)
     def graph() -> HTMLResponse:
-        return page("Graph", "<p>The explicit knowledge graph will appear here.</p>")
+        legend = "".join(
+            f'<span class="graph-key" style="background:{color}"></span>{label}'
+            for _, label, color in GRAPH_TYPES
+        )
+        return page(
+            "Knowledge graph",
+            """<p>Published wiki pages connected by deliberate wikilinks.</p>
+<section class="graph-shell"><svg id="knowledge-graph" role="img" aria-label="Published knowledge graph"></svg>
+<div id="graph-tooltip" role="status" aria-live="polite"></div>
+<div id="graph-validation" aria-live="polite"></div></section>
+<section aria-label="Graph legend"><p>"""
+            + legend
+            + """</p></section>
+<script src="/assets/d3.v7.9.0.min.js"></script>
+<script>
+(() => {
+  const svg = d3.select("#knowledge-graph");
+  const tooltip = d3.select("#graph-tooltip");
+  const validation = d3.select("#graph-validation");
+  const width = 820;
+  const height = 500;
+  svg.attr("viewBox", `0 0 ${width} ${height}`);
+  const canvas = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.35, 3]).on("zoom", event => canvas.attr("transform", event.transform)));
+
+  fetch("/api/graph")
+    .then(response => response.json())
+    .then(graph => {
+      if (graph.validation.length) {
+        validation.text(`${graph.validation.length} invalid explicit wikilink${graph.validation.length === 1 ? "" : "s"} omitted from this graph.`);
+      }
+      const links = canvas.append("g").attr("stroke", "#9caab5").attr("stroke-opacity", 0.7)
+        .selectAll("line").data(graph.edges).join("line").attr("stroke-width", 1.5);
+      const nodes = canvas.append("g").selectAll("circle").data(graph.nodes).join("circle")
+        .attr("r", node => 8 + Math.sqrt(node.connections) * 5)
+        .attr("fill", node => node.color).attr("stroke", "#fff").attr("stroke-width", 2)
+        .attr("tabindex", 0).attr("role", "link").attr("aria-label", node => `${node.title}, ${node.type}`)
+        .on("pointerenter", (_, node) => tooltip.text(`${node.title} — ${node.type}, ${node.connections} connection${node.connections === 1 ? "" : "s"}`))
+        .on("pointerleave", () => tooltip.text(""))
+        .on("click", (_, node) => window.location.assign(node.target))
+        .on("keydown", (event, node) => { if (event.key === "Enter") window.location.assign(node.target); });
+      const simulation = d3.forceSimulation(graph.nodes)
+        .force("link", d3.forceLink(graph.edges).id(node => node.id).distance(110))
+        .force("charge", d3.forceManyBody().strength(-260))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collide", d3.forceCollide().radius(node => 16 + Math.sqrt(node.connections) * 5))
+        .on("tick", () => {
+          links.attr("x1", edge => edge.source.x).attr("y1", edge => edge.source.y)
+            .attr("x2", edge => edge.target.x).attr("y2", edge => edge.target.y);
+          nodes.attr("cx", node => node.x).attr("cy", node => node.y);
+        });
+      nodes.call(d3.drag().on("start", event => { if (!event.active) simulation.alphaTarget(0.3).restart(); })
+        .on("drag", (event, node) => { node.fx = event.x; node.fy = event.y; })
+        .on("end", (event, node) => { if (!event.active) simulation.alphaTarget(0); node.fx = null; node.fy = null; }));
+    });
+})();
+</script>""",
+        )
+
+    @app.get("/api/graph")
+    def knowledge_graph() -> dict[str, list[dict[str, Any]]]:
+        return graph_data(PublishedWiki(publisher.vault))
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
