@@ -9,9 +9,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
+
+
+def outcome_direction(text: str) -> str | None:
+    if "higher outcome" in text:
+        return "higher"
+    if "lower outcome" in text:
+        return "lower"
+    return None
 
 
 def main() -> int:
@@ -22,7 +31,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
@@ -38,6 +47,9 @@ def main() -> int:
     request = json.loads(open(sys.argv[2], encoding="utf-8").read())
     source_id = request["source_id"]
     title = request["metadata"].get("title") or "Untitled paper"
+    source_text = open(request["derivative_path"], encoding="utf-8").read().casefold()
+    substantive_method = "method" in source_text
+    current_direction = outcome_direction(source_text)
     vault = os.path.abspath(request["staged_vault"])
     if not request.get("evidence_is_untrusted") or not os.path.abspath(sys.argv[2]).startswith(vault):
         print("invalid staged ingest request", file=sys.stderr)
@@ -69,6 +81,15 @@ def main() -> int:
     topic_directory = os.path.join(vault, "topics")
     os.makedirs(topic_directory, exist_ok=True)
     citation = f"source-{source_id[:12]}-p1"
+    topic_path = os.path.join(topic_directory, "research-methods.md")
+    existing_topic = (
+        open(topic_path, encoding="utf-8").read() if os.path.exists(topic_path) else None
+    )
+    related_pages = (
+        f"[[topics/research-methods|Research methods]] [^{citation}]"
+        if substantive_method
+        else "No related pages yet."
+    )
     page = f'''---
 page_type: paper
 id: paper-{source_id}
@@ -100,7 +121,7 @@ Dataset details remain limited to the cited paper. [^{citation}]
 The paper's limitations require cautious interpretation. [^{citation}]
 
 ## Related pages
-[[topics/research-methods|Research methods]] [^{citation}]
+{related_pages}
 
 ## Contradictions and open questions
 No contradictions identified.
@@ -113,8 +134,34 @@ No contradictions identified.
 <!-- researcher-annotations:end -->
 '''
     open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(page)
-    topic_path = os.path.join(topic_directory, "research-methods.md")
-    if not os.path.exists(topic_path):
+    existing_sources = (
+        re.findall(r"— source ([0-9a-f]{64}) — PDF p\. \d+", existing_topic)
+        if existing_topic
+        else []
+    )
+    first_direction_match = (
+        re.search(r"<!-- fake-claim-direction: (higher|lower) -->", existing_topic)
+        if existing_topic
+        else None
+    )
+    first_direction = first_direction_match.group(1) if first_direction_match else None
+    historical_citations = "\n".join(
+        line for line in (existing_topic or "").splitlines() if line.startswith("[^")
+    )
+    historical_claim_context = "\n".join(
+        line
+        for line in (existing_topic or "").splitlines()
+        if not line.startswith("[^") and "[^" in line
+    )
+    contradiction = (
+        substantive_method
+        and bool(existing_sources)
+        and {first_direction, current_direction} == {"higher", "lower"}
+    )
+    possible_duplicate = (
+        substantive_method and bool(existing_sources) and "possible duplicate" in source_text
+    )
+    if substantive_method and not existing_sources:
         topic = f'''---
 page_type: topic
 id: topic-research-methods
@@ -128,9 +175,102 @@ possible_duplicates: []
 # Research methods
 
 ## Summary
-Research methods are maintained as explicit wiki knowledge. [^{citation}]
+Research methods are a substantive reusable method topic supported by this source. [^{citation}]
+
+## Related evidence
+[[papers/{source_id}|{title}]] [^{citation}]
 
 ## Evidence citations
+[^{citation}]: {title} — source {source_id} — PDF p. 1
+
+<!-- fake-claim-direction: {current_direction or 'unknown'} -->
+
+## Researcher annotations
+<!-- researcher-annotations:start -->
+<!-- researcher-annotations:end -->
+'''
+        open(topic_path, "w", encoding="utf-8").write(topic)
+    elif substantive_method:
+        first_source = existing_sources[0]
+        first_citation = f"source-{first_source[:12]}-p1"
+        variant_path = os.path.join(topic_directory, "research-method-variants.md")
+        if possible_duplicate:
+            variant = f'''---
+page_type: topic
+id: topic-research-method-variants
+title: "Research method variants"
+aliases: []
+supporting_sources:
+  - {source_id}
+created: 2026-07-26
+possible_duplicates:
+  - topics/research-methods
+---
+# Research method variants
+
+## Summary
+This separately maintained method page may describe the same method family. [^{citation}]
+
+## Related pages
+[[topics/research-methods|Research methods]] [^{citation}]
+
+## Evidence citations
+[^{citation}]: {title} — source {source_id} — PDF p. 1
+
+## Researcher annotations
+<!-- researcher-annotations:start -->
+<!-- researcher-annotations:end -->
+'''
+            open(variant_path, "w", encoding="utf-8").write(variant)
+        duplicate_metadata = (
+            "possible_duplicates:\n  - topics/research-method-variants"
+            if possible_duplicate
+            else "possible_duplicates: []"
+        )
+        variant_link = (
+            f"[[topics/research-method-variants|Research method variants]] [^{citation}]\n"
+            if possible_duplicate
+            else ""
+        )
+        contradiction_section = (
+            "## Contradictions\n"
+            f"[[papers/{first_source}|Earlier paper]] reports a {first_direction} outcome. [^{first_citation}]\n"
+            f"[[papers/{source_id}|{title}]] reports a {current_direction} outcome. [^{citation}]\n\n"
+            if contradiction
+            else ""
+        )
+        possible_duplicate_section = (
+            "## Possible duplicates\n"
+            f"[[topics/research-method-variants|Research method variants]] remains separate pending identity confirmation. [^{citation}]\n\n"
+            if possible_duplicate
+            else ""
+        )
+        topic = f'''---
+page_type: topic
+id: topic-research-methods
+title: "Research methods"
+aliases: []
+supporting_sources:
+  - {first_source}
+  - {source_id}
+created: 2026-07-26
+{duplicate_metadata}
+---
+# Research methods
+
+## Summary
+This substantive method topic accumulates evidence from two sources without collapsing their disagreement. [^{first_citation}] [^{citation}]
+
+## Prior evidence
+{historical_claim_context}
+
+## Related evidence
+[[papers/{source_id}|{title}]] [^{citation}]
+{variant_link}
+
+{contradiction_section}{possible_duplicate_section}## Evidence citations
+
+{historical_citations}
 [^{citation}]: {title} — source {source_id} — PDF p. 1
 
 ## Researcher annotations
@@ -140,17 +280,31 @@ Research methods are maintained as explicit wiki knowledge. [^{citation}]
         open(topic_path, "w", encoding="utf-8").write(topic)
     with open(os.path.join(vault, "index.md"), "a", encoding="utf-8") as index:
         index.write(f"- [[papers/{source_id}]] — {title}\n")
-        if "[[topics/research-methods]]" not in open(os.path.join(vault, "index.md"), encoding="utf-8").read():
+        if substantive_method and "[[topics/research-methods]]" not in open(os.path.join(vault, "index.md"), encoding="utf-8").read():
             index.write("- [[topics/research-methods]] — Research methods\n")
+        if possible_duplicate and "[[topics/research-method-variants]]" not in open(os.path.join(vault, "index.md"), encoding="utf-8").read():
+            index.write("- [[topics/research-method-variants]] — Research method variants\n")
     with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
+        affected_pages = f"[[papers/{source_id}]]"
+        if substantive_method:
+            affected_pages += ", [[topics/research-methods]]"
+        if possible_duplicate:
+            affected_pages += ", [[topics/research-method-variants]]"
         log.write(
             f"\n## [2026-07-26] ingest | {title}\n"
-            f"Source: {source_id}\nAffected pages: [[papers/{source_id}]]\n"
-            "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
+            f"Source: {source_id}\nAffected pages: {affected_pages}\n"
+            f"Contradictions: {1 if contradiction else 'none'}\n"
+            f"Possible duplicates: {1 if possible_duplicate else 'none'}\nOutcome: published\n"
         )
     if mode == "invalid":
         open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(
             "The staged writer intentionally returned malformed content.\n"
+        )
+    if mode == "drop-history" and existing_sources:
+        first_source = existing_sources[0]
+        topic = open(topic_path, encoding="utf-8").read()
+        open(topic_path, "w", encoding="utf-8").write(
+            topic.replace(f"source {first_source}", f"source {source_id}")
         )
     if mode == "annotation":
         for filename in os.listdir(page_directory):

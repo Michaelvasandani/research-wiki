@@ -40,8 +40,14 @@ def test_graph_api_exposes_published_page_identity_type_target_and_explicit_edge
     tmp_path: Path,
 ) -> None:
     with make_client(tmp_path) as client:
-        first_source = publish_paper(client, "first.pdf", "A research method is evaluated.")
-        second_source = publish_paper(client, "second.pdf", "A related research method is evaluated.")
+        first_source = publish_paper(
+            client, "first.pdf", "A research method has a higher outcome."
+        )
+        second_source = publish_paper(
+            client,
+            "second.pdf",
+            "A possible duplicate research method has a lower outcome.",
+        )
         graph = client.get("/api/graph")
 
     assert graph.status_code == 200
@@ -52,7 +58,7 @@ def test_graph_api_exposes_published_page_identity_type_target_and_explicit_edge
         "title": "first",
         "type": "paper",
         "target": f"/wiki/papers/{first_source}",
-        "connections": 1,
+        "connections": 2,
         "color": "#2d6a9f",
     }
     assert nodes["/wiki/topics/research-methods"] == {
@@ -60,6 +66,14 @@ def test_graph_api_exposes_published_page_identity_type_target_and_explicit_edge
         "title": "Research methods",
         "type": "topic",
         "target": "/wiki/topics/research-methods",
+        "connections": 6,
+        "color": "#3d8b67",
+    }
+    assert nodes["/wiki/topics/research-method-variants"] == {
+        "id": "topic-research-method-variants",
+        "title": "Research method variants",
+        "type": "topic",
+        "target": "/wiki/topics/research-method-variants",
         "connections": 2,
         "color": "#3d8b67",
     }
@@ -69,6 +83,10 @@ def test_graph_api_exposes_published_page_identity_type_target_and_explicit_edge
     } == {
         (f"paper-{first_source}", "topic-research-methods"),
         (f"paper-{second_source}", "topic-research-methods"),
+        ("topic-research-method-variants", "topic-research-methods"),
+        ("topic-research-methods", f"paper-{first_source}"),
+        ("topic-research-methods", f"paper-{second_source}"),
+        ("topic-research-methods", "topic-research-method-variants"),
     }
     assert payload["validation"] == []
 

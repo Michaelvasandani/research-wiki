@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from io import BytesIO
 from hashlib import sha256
@@ -763,6 +764,7 @@ class AtomicWikiPublisher:
     """Stages, validates, and publishes one complete wiki update as one commit."""
 
     page_prefix = "papers"
+    topic_prefix = "topics"
 
     def __init__(self, sources: SourceCatalog, settings: Settings) -> None:
         self.sources = sources
@@ -896,25 +898,36 @@ class AtomicWikiPublisher:
 
     def _validate(self, stage: Path, source_id: str, derivative_path: Path) -> None:
         self._validate_annotations(stage)
-        pages = list((stage / self.page_prefix).glob("*.md"))
-        if not pages:
+        self._validate_historical_citations(stage)
+        paper_pages = list((stage / self.page_prefix).glob("*.md"))
+        topic_pages = list((stage / self.topic_prefix).glob("*.md"))
+        pages = [*paper_pages, *topic_pages]
+        if not paper_pages:
             raise PublicationRejected("The staged ingest did not create a paper page.")
         expected_page = stage / self.page_prefix / f"{source_id}.md"
-        if expected_page not in pages:
+        if expected_page not in paper_pages:
             raise PublicationRejected("The staged ingest did not create the source paper page.")
         citation_pages = self._citation_pages(source_id, derivative_path)
-        for page_path in pages:
+        for page_path in paper_pages:
             self._validate_page(
                 page_path,
                 citation_pages,
                 required_source=source_id if page_path == expected_page else None,
             )
+        for topic_path in topic_pages:
+            self._validate_topic_page(topic_path, citation_pages)
         self._validate_wikilinks(stage, pages)
-        self._validate_index_and_log(stage, source_id, expected_page)
         # Rebuild the proposed index ourselves before looking at it. A writer may
         # have staged files already; inspecting only untracked paths would let a
         # staged PDF or manifest bypass this gate.
         self._run_git(stage, "add", "--all")
+        changed_pages = [
+            stage / name
+            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/"))
+            and name.endswith(".md")
+        ]
+        self._validate_index_and_log(stage, source_id, expected_page, changed_pages)
         tracked_names = self._run_git(stage, "ls-files")
         prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
         if any(part in tracked_names.lower() for part in prohibited):
@@ -933,6 +946,46 @@ class AtomicWikiPublisher:
                 staged_page.read_text(encoding="utf-8")
             ):
                 raise PublicationRejected("The staged writer modified researcher annotations.")
+
+    def _validate_historical_citations(self, stage: Path) -> None:
+        """Keep existing cited evidence and its claim context during revisions."""
+
+        if not self.vault.exists():
+            return
+        for old_page in self.vault.rglob("*.md"):
+            if ".git" in old_page.parts:
+                continue
+            staged_page = stage / old_page.relative_to(self.vault)
+            if not staged_page.exists():
+                continue
+            previous_citations, previous_context = self._citation_history(
+                old_page.read_text(encoding="utf-8")
+            )
+            staged_citations, staged_context = self._citation_history(
+                staged_page.read_text(encoding="utf-8")
+            )
+            if previous_citations - staged_citations:
+                raise PublicationRejected("The staged writer removed a historical evidence citation.")
+            if previous_context - staged_context:
+                raise PublicationRejected(
+                    "The staged writer changed a historical cited claim context."
+                )
+
+    @staticmethod
+    def _citation_history(contents: str) -> tuple[Counter[str], Counter[str]]:
+        definitions = Counter(
+            re.findall(r"^\[\^[^]]+\]: .+$", contents, flags=re.MULTILINE)
+        )
+        citation_ids = {
+            note_id for note_id in re.findall(r"^\[\^([^]]+)\]: .+$", contents, flags=re.MULTILINE)
+        }
+        contexts = Counter(
+            line
+            for line in contents.splitlines()
+            if not line.startswith("[^")
+            and any(f"[^{note_id}]" in line for note_id in citation_ids)
+        )
+        return definitions, contexts
 
     @staticmethod
     def _annotation_bytes(contents: str) -> str:
@@ -1001,6 +1054,18 @@ class AtomicWikiPublisher:
         )
         if any(section not in contents for section in required_sections):
             raise PublicationRejected(f"{page_path.name} is missing a required paper section.")
+        self._validate_citations_and_claims(
+            page_path, citation_pages, required_source=required_source
+        )
+
+    @staticmethod
+    def _validate_citations_and_claims(
+        page_path: Path,
+        citation_pages: dict[str, set[int]],
+        *,
+        required_source: str | None = None,
+    ) -> None:
+        contents = page_path.read_text(encoding="utf-8")
         footnotes = re.findall(
             r"^\[\^([^]]+)\]: (.+?) — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
             contents,
@@ -1031,6 +1096,80 @@ class AtomicWikiPublisher:
                     f"{page_path.name} contains an uncited factual claim."
                 )
 
+    def _validate_topic_page(
+        self, page_path: Path, citation_pages: dict[str, set[int]]
+    ) -> None:
+        contents = page_path.read_text(encoding="utf-8")
+        required_metadata = (
+            "page_type: topic",
+            "id: topic-",
+            "title:",
+            "aliases:",
+            "supporting_sources:",
+            "created:",
+            "possible_duplicates:",
+        )
+        if not contents.startswith("---\n") or any(
+            item not in contents for item in required_metadata
+        ):
+            raise PublicationRejected(f"{page_path.name} has invalid topic metadata.")
+        required_sections = (
+            "## Summary",
+            "## Evidence citations",
+            "## Researcher annotations\n<!-- researcher-annotations:start -->",
+            "<!-- researcher-annotations:end -->",
+        )
+        if any(section not in contents for section in required_sections):
+            raise PublicationRejected(f"{page_path.name} is missing a required topic section.")
+        self._validate_citations_and_claims(page_path, citation_pages)
+        frontmatter = contents.split("---\n", 2)[1]
+        supporting_sources = set(
+            re.findall(r"^  - ([0-9a-f]{64})$", frontmatter, flags=re.MULTILINE)
+        )
+        citation_sources = {
+            source_id
+            for _, _, source_id, _ in re.findall(
+                r"^\[\^([^]]+)\]: (.+?) — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
+                contents,
+                flags=re.MULTILINE,
+            )
+        }
+        if not supporting_sources.issubset(citation_sources):
+            raise PublicationRejected(
+                f"{page_path.name} omits cited evidence for a supporting source."
+            )
+        if "## Contradictions\n" in contents:
+            contradiction = contents.split("## Contradictions\n", 1)[1].split("\n## ", 1)[0]
+            footnote_sources = {
+                note_id: source_id
+                for note_id, _, source_id, _ in re.findall(
+                    r"^\[\^([^]]+)\]: (.+?) — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
+                    contents,
+                    flags=re.MULTILINE,
+                )
+            }
+            claim_citations = [
+                re.findall(r"\[\^([^]]+)\]", line)
+                for line in contradiction.splitlines()
+                if "[^" in line
+            ]
+            contradiction_sources = {
+                footnote_sources[note_id]
+                for citations in claim_citations
+                for note_id in citations
+                if note_id in footnote_sources
+            }
+            if len(claim_citations) < 2 or len(contradiction_sources) < 2:
+                raise PublicationRejected(
+                    f"{page_path.name} must retain separately cited claims from both sources."
+                )
+        possible_duplicates = re.findall(r"^  - (topics/[^\s]+)$", contents, flags=re.MULTILINE)
+        links = set(re.findall(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", contents))
+        if any(duplicate not in links for duplicate in possible_duplicates):
+            raise PublicationRejected(
+                f"{page_path.name} does not explicitly link a possible duplicate."
+            )
+
     def _validate_wikilinks(self, stage: Path, pages: list[Path]) -> None:
         for page_path in pages:
             contents = page_path.read_text(encoding="utf-8")
@@ -1043,7 +1182,13 @@ class AtomicWikiPublisher:
                 if not (stage / f"{link}.md").exists():
                     raise PublicationRejected(f"{page_path.name} links to a missing page: {link}.")
 
-    def _validate_index_and_log(self, stage: Path, source_id: str, page_path: Path) -> None:
+    def _validate_index_and_log(
+        self,
+        stage: Path,
+        source_id: str,
+        page_path: Path,
+        changed_pages: list[Path],
+    ) -> None:
         index = (stage / "index.md").read_text(encoding="utf-8")
         log = (stage / "log.md").read_text(encoding="utf-8")
         link = f"[[{page_path.relative_to(stage).with_suffix('').as_posix()}]]"
@@ -1051,6 +1196,26 @@ class AtomicWikiPublisher:
             raise PublicationRejected("The content index does not list the paper page.")
         if source_id not in log or link not in log:
             raise PublicationRejected("The activity log does not record this source and page.")
+        latest_entry = re.split(r"\n(?=## \[)", log)[-1]
+        for changed_page in changed_pages:
+            changed_link = f"[[{changed_page.relative_to(stage).with_suffix('').as_posix()}]]"
+            if changed_link not in index:
+                raise PublicationRejected("The content index does not list an affected wiki page.")
+            if changed_link not in latest_entry:
+                raise PublicationRejected("The activity log does not describe an affected wiki page.")
+        changed_contents = {
+            path: path.read_text(encoding="utf-8") for path in changed_pages
+        }
+        if any(
+            "possible_duplicates:" in contents
+            and "possible_duplicates: []" not in contents
+            for contents in changed_contents.values()
+        ):
+            if "Possible duplicates:" not in latest_entry or "Possible duplicates: none" in latest_entry:
+                raise PublicationRejected("The activity log omits affected possible duplicates.")
+        if any("## Contradictions\n" in contents for contents in changed_contents.values()):
+            if "Contradictions:" not in latest_entry or "Contradictions: none" in latest_entry:
+                raise PublicationRejected("The activity log omits affected contradictions.")
 
 
 NAVIGATION = (
@@ -1071,6 +1236,13 @@ copy of this vault with network access disabled. Cite every factual claim with
 the stable source identity and a physical PDF page, preserve the final
 researcher-annotation section byte-for-byte, update `index.md` and append to
 `log.md`, then publish one validated Git commit or no live change at all.
+
+Create or update topic pages only for substantive reusable concepts or methods
+with definitions, assumptions, variants, evidence, or relationships; leave
+incidental terminology inline. When sources disagree, retain each cited claim
+as a contradiction. When identity is ambiguous, keep pages separate, connect
+them with explicit wikilinks and a `possible_duplicates` flag, and record both
+conditions in the activity log.
 """
 
 
