@@ -28,6 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from markitdown import MarkItDown
 from pypdf import PdfReader, PdfWriter
 
+from researchos.obsidian import ObsidianWatcher, PageConflictStore
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -1176,11 +1178,17 @@ class AtomicWikiPublisher:
     page_prefix = "papers"
     topic_prefix = "topics"
 
-    def __init__(self, sources: SourceCatalog, settings: Settings) -> None:
+    def __init__(
+        self,
+        sources: SourceCatalog,
+        settings: Settings,
+        conflicts: PageConflictStore | None = None,
+    ) -> None:
         self.sources = sources
         self.settings = settings
         self.vault = settings.data_dir / "vault"
         self.runtime_dir = settings.data_dir / "runtime"
+        self.conflicts = conflicts or PageConflictStore(self.runtime_dir)
         self.codex = CodexWorker(settings)
 
     def publish(self, source_id: str, derivative_path: Path) -> None:
@@ -1640,6 +1648,7 @@ class AtomicWikiPublisher:
                 "The wiki changed concurrently and the update could not be rebased; retry after resolving the page conflict."
             ) from error
         revalidate()
+        self._reject_conflicted_changes(stage)
         self._replace_live_vault(stage, expected_head=current_head)
 
     @staticmethod
@@ -1676,6 +1685,7 @@ class AtomicWikiPublisher:
     def _commit(self, stage: Path, source_id: str, *, operation: str = "ingest") -> None:
         if not self._run_git(stage, "diff", "--cached", "--name-only"):
             raise PublicationRejected("Codex produced no wiki update to publish.")
+        self._reject_conflicted_changes(stage)
         self._run_git(
             stage,
             "-c",
@@ -1686,6 +1696,13 @@ class AtomicWikiPublisher:
             "-m",
             f"{operation}: {source_id}",
         )
+
+    def _reject_conflicted_changes(self, stage: Path) -> None:
+        conflicts = self.conflicts.conflicted_paths(self._changed_paths(stage))
+        if conflicts:
+            raise PublicationRejected(
+                "Automatic writers are paused for page conflict(s): " + ", ".join(conflicts)
+            )
 
     def _changed_paths(self, stage: Path) -> list[str]:
         """Return this writer's paths both before and after a rebase commit."""
@@ -2933,10 +2950,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     state = FileState(settings.data_dir)
     sources = SourceCatalog(settings.data_dir)
     worker = CodexWorker(settings)
-    publisher = AtomicWikiPublisher(sources, settings)
+    conflicts = PageConflictStore(settings.data_dir / "runtime")
+    publisher = AtomicWikiPublisher(sources, settings, conflicts)
     publisher.recover_pending_withdrawals()
     ingest_worker = IngestWorker(sources, settings, publisher)
     ingest_service = IngestWorkerService(ingest_worker)
+    obsidian_watcher = ObsidianWatcher(publisher.vault, conflicts)
     research_service = ResearchService(state, sources, worker, publisher.vault)
     app = FastAPI(title="ResearchOS Local MVP")
     app.mount(
@@ -2947,11 +2966,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.on_event("startup")
     def start_ingest_service() -> None:
+        obsidian_watcher.start()
         if settings.run_ingest_service:
             ingest_service.start()
 
     @app.on_event("shutdown")
     def stop_ingest_service() -> None:
+        obsidian_watcher.stop()
         if settings.run_ingest_service:
             ingest_service.stop()
 
@@ -3376,6 +3397,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="No published wiki activity log.")
         return page("Wiki activity", render_markdown(activity_path.read_text(encoding="utf-8"), published))
 
+    @app.post("/wiki/{page_path:path}/resolve-conflict")
+    def resolve_page_conflict(page_path: str) -> RedirectResponse:
+        normalised_path = PublishedWiki._normalise_path(page_path)
+        if not conflicts.resolve(f"{normalised_path}.md"):
+            raise HTTPException(status_code=404, detail="This page has no active conflict.")
+        return RedirectResponse(wiki_href(normalised_path), status_code=303)
+
     @app.get("/wiki/{page_path:path}", response_class=HTMLResponse)
     def wiki_page(page_path: str) -> HTMLResponse:
         published = PublishedWiki(publisher.vault)
@@ -3393,12 +3421,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if backlinks
             else "<section><h2>Backlinks</h2><p>No explicit backlinks.</p></section>"
         )
+        conflict_notice = (
+            "<section><p><strong>Page conflict:</strong> Automatic writers are paused "
+            "until you resolve this AI-managed edit.</p>"
+            f'<form action="/wiki/{escape(current_page.path)}/resolve-conflict" method="post">'
+            "<button>Resume automatic updates</button></form></section>"
+            if any(
+                conflict.path == f"{current_page.path}.md"
+                for conflict in conflicts.conflicts()
+            )
+            else ""
+        )
         return page(
             current_page.title,
             render_metadata(current_page.metadata)
             + render_markdown(current_page.body, published)
+            + conflict_notice
             + backlink_section,
         )
+
+    @app.get("/api/wiki/conflicts")
+    def wiki_conflicts() -> dict[str, list[dict[str, str]]]:
+        return {
+            "conflicts": [
+                {"path": conflict.path, "detected_at": conflict.detected_at}
+                for conflict in conflicts.conflicts()
+            ]
+        }
 
     @app.get("/graph", response_class=HTMLResponse)
     def graph() -> HTMLResponse:
