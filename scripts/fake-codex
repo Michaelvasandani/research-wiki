@@ -33,10 +33,29 @@ def research(request_path: str, mode: str) -> int:
     request = json.loads(open(request_path, encoding="utf-8").read())
     vault = os.path.abspath(request["published_vault"])
     index_path = request.get("index_path")
+    index_contents = ""
     if index_path and os.path.exists(index_path):
-        open(index_path, encoding="utf-8").read()
+        index_contents = open(index_path, encoding="utf-8").read()
+    page_contents: list[str] = []
     for page in request.get("pages", []):
-        open(page["file"], encoding="utf-8").read()
+        page_contents.append(open(page["file"], encoding="utf-8").read())
+    if mode == "withdrawn-hidden":
+        withdrawn_ids = {
+            source["source_id"] for source in request.get("withdrawn_sources", [])
+        }
+        if any(
+            source_id in index_contents or any(source_id in contents for contents in page_contents)
+            for source_id in withdrawn_ids
+        ):
+            print("withdrawn evidence reached research worker", file=sys.stderr)
+            return 76
+        if any(
+            source_id in message.get("content", "")
+            for source_id in withdrawn_ids
+            for message in request.get("thread", [])
+        ):
+            print("withdrawn chat evidence reached research worker", file=sys.stderr)
+            return 77
     source_ids: list[str] = []
     for derivative in request.get("derivatives", []):
         open(derivative["path"], encoding="utf-8").read()
@@ -212,7 +231,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "file-invalid", "file-annotation", "file-corrupt-existing"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "withdrawn-hidden", "file-invalid", "file-annotation", "file-corrupt-existing"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:

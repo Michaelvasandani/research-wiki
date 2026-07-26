@@ -205,6 +205,82 @@ class SourceCatalog:
         self._write_manifest(self.manifest_path, "sources", sources)
         return source
 
+    def begin_withdrawal(self, source_id: str) -> dict[str, Any]:
+        """Durably exclude a source before publishing its visible withdrawal marks."""
+
+        sources = self._read_manifest(self.manifest_path, "sources")
+        jobs = self._read_manifest(self.job_path, "jobs")
+        source = sources.get(source_id)
+        job = jobs.get(source_id)
+        if source is None or job is None:
+            raise KeyError(source_id)
+        if not job.get("published") or job.get("status") != "completed":
+            raise ValueError("Only a completed ingested source can be withdrawn.")
+        if source.get("withdrawal", {}).get("status") == "withdrawn":
+            raise ValueError("This ingested source is already withdrawn.")
+        if source.get("withdrawal", {}).get("status") == "pending":
+            raise ValueError("This ingested source withdrawal is still completing.")
+        source["withdrawal"] = {"status": "pending"}
+        self._write_manifest(self.manifest_path, "sources", sources)
+        return source
+
+    def complete_withdrawal(self, source_id: str) -> dict[str, Any]:
+        """Record the published terminal state after its staged commit is live."""
+
+        sources = self._read_manifest(self.manifest_path, "sources")
+        source = sources.get(source_id)
+        if source is None:
+            raise KeyError(source_id)
+        if source.get("withdrawal", {}).get("status") != "pending":
+            raise ValueError("This source has no pending withdrawal to complete.")
+        source["withdrawal"] = {"status": "withdrawn"}
+        self._write_manifest(self.manifest_path, "sources", sources)
+        return source
+
+    def cancel_withdrawal(self, source_id: str) -> None:
+        """Return a source to active evidence after a pre-publication failure."""
+
+        sources = self._read_manifest(self.manifest_path, "sources")
+        source = sources.get(source_id)
+        if source is None:
+            raise KeyError(source_id)
+        if source.get("withdrawal", {}).get("status") == "pending":
+            source.pop("withdrawal", None)
+            self._write_manifest(self.manifest_path, "sources", sources)
+
+    def remove_pre_ingest(self, source_id: str) -> None:
+        """Hard-delete only an upload that never became published evidence."""
+
+        sources = self._read_manifest(self.manifest_path, "sources")
+        jobs = self._read_manifest(self.job_path, "jobs")
+        source = sources.get(source_id)
+        job = jobs.get(source_id)
+        if source is None or job is None:
+            raise KeyError(source_id)
+        if job.get("published") or job.get("status") == "completed":
+            raise ValueError(
+                "Completed ingested sources are preserved; withdraw them instead."
+            )
+        if job.get("status") == "processing":
+            raise ValueError("A source cannot be removed while ingest is processing.")
+        if source.get("revised_by"):
+            raise ValueError("Remove pre-ingest revisions before removing their source.")
+        revision_of = source.get("revision_of")
+        if isinstance(revision_of, str) and revision_of in sources:
+            revised_by = sources[revision_of].get("revised_by", [])
+            sources[revision_of]["revised_by"] = [
+                item for item in revised_by if item != source_id
+            ]
+        del sources[source_id]
+        del jobs[source_id]
+        self._write_manifest(self.manifest_path, "sources", sources)
+        self._write_manifest(self.job_path, "jobs", jobs)
+        self.dequeue(source_id)
+        self.source_path(source_id).unlink(missing_ok=True)
+        derivative_dir = self.source_dir.parent / "derivatives" / source_id
+        if derivative_dir.exists():
+            shutil.rmtree(derivative_dir)
+
     @staticmethod
     def normalise_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         title = metadata.get("title")
@@ -1173,6 +1249,49 @@ class AtomicWikiPublisher:
                 shutil.rmtree(stage)
             raise
 
+    def publish_withdrawal(self, source_id: str) -> None:
+        """Atomically mark every page supported by a withdrawn source."""
+
+        source = self.sources.source(source_id)
+        job = self.sources.job(source_id)
+        if source is None or job is None:
+            raise PublicationRejected("The source disappeared before withdrawal.")
+        if not job.get("published") or job.get("status") != "completed":
+            raise PublicationRejected("Only a completed ingested source can be withdrawn.")
+        if source.get("withdrawal", {}).get("status") != "pending":
+            raise PublicationRejected("A withdrawal must be durably pending before publication.")
+        base_head = self._head(self.vault)
+        stage = self._copy_fixed_snapshot()
+        try:
+            affected_pages = self._mark_withdrawn_evidence(stage, source_id)
+            if not affected_pages:
+                raise PublicationRejected("The ingested source has no published evidence to mark.")
+            self._validate_withdrawal(stage, source_id, affected_pages)
+            self._commit(stage, source_id, operation="withdrawal")
+            if self._head(self.vault) != base_head:
+                raise PublicationRejected(
+                    "The live wiki changed while withdrawal was staged."
+                )
+            self._replace_live_vault(stage)
+        except Exception:
+            if stage.exists():
+                shutil.rmtree(stage)
+            raise
+
+    def recover_pending_withdrawals(self) -> None:
+        """Finish a crashed post-publication state transition, or safely cancel it."""
+
+        for source in self.sources.sources():
+            if source.get("withdrawal", {}).get("status") != "pending":
+                continue
+            source_id = source["source_id"]
+            paper_path = self.vault / self.page_prefix / f"{source_id}.md"
+            marker = f"<!-- researchos: withdrawn-source: {source_id} -->"
+            if paper_path.exists() and marker in paper_path.read_text(encoding="utf-8"):
+                self.sources.complete_withdrawal(source_id)
+            else:
+                self.sources.cancel_withdrawal(source_id)
+
     def publish_filed_analysis(
         self, title: str, analysis: str, source_ids: list[str]
     ) -> str:
@@ -1197,6 +1316,10 @@ class AtomicWikiPublisher:
             ):
                 raise PublicationRejected(
                     "A filed analysis may use only published ingested sources."
+                )
+            if source.get("withdrawal", {}).get("status") == "withdrawn":
+                raise PublicationRejected(
+                    "A filed analysis may not use withdrawn ingested sources."
                 )
             supporting_sources.append(
                 {
@@ -1287,6 +1410,112 @@ class AtomicWikiPublisher:
                 f"Source: {source_id}\nAffected pages: {paper_link}\n"
                 "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
             )
+
+    def _mark_withdrawn_evidence(self, stage: Path, source_id: str) -> list[Path]:
+        """Add a cited, visible status block without rewriting historical claims."""
+
+        affected_pages: list[Path] = []
+        citation_pattern = re.compile(
+            rf"^\[\^([^]]+)\]: .+? — source {re.escape(source_id)} — PDF p\. \d+\s*$",
+            flags=re.MULTILINE,
+        )
+        marker = f"<!-- researchos: withdrawn-source: {source_id} -->"
+        for page_path in sorted(stage.rglob("*.md")):
+            if ".git" in page_path.parts:
+                continue
+            contents = page_path.read_text(encoding="utf-8")
+            citation = citation_pattern.search(contents)
+            if citation is None:
+                continue
+            affected_pages.append(page_path)
+            if marker in contents:
+                continue
+            note_id = citation.group(1)
+            status_block = (
+                f"\n## Evidence status\n{marker}\n"
+                "**Withdrawn evidence:** This page relies on a withdrawn source. "
+                "It is retained for historical context and excluded from future research. "
+                f"[^{note_id}]\n"
+            )
+            if "\n## Evidence citations\n" not in contents:
+                raise PublicationRejected("An affected wiki page has no evidence-citation section.")
+            page_path.write_text(
+                contents.replace("\n## Evidence citations\n", status_block + "\n## Evidence citations\n", 1),
+                encoding="utf-8",
+            )
+
+        paper_path = stage / self.page_prefix / f"{source_id}.md"
+        if paper_path not in affected_pages:
+            raise PublicationRejected("The ingested source has no published paper page.")
+        paper_link = f"[[papers/{source_id}]]"
+        index_path = stage / "index.md"
+        index = index_path.read_text(encoding="utf-8")
+        index_path.write_text(
+            re.sub(
+                rf"(?m)^(- \[\[papers/{re.escape(source_id)}\]\] — .*?)( \(withdrawn\))?$",
+                r"\1 (withdrawn)",
+                index,
+            ),
+            encoding="utf-8",
+        )
+        links = ", ".join(
+            f"[[{path.relative_to(stage).with_suffix('').as_posix()}]]"
+            for path in affected_pages
+        )
+        with (stage / "log.md").open("a", encoding="utf-8") as log:
+            log.write(
+                f"\n## [2026-07-26] withdrawal | {source_id}\n"
+                f"Source: {source_id}\nAffected pages: {links}\n"
+                "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
+            )
+        return affected_pages
+
+    def _validate_withdrawal(
+        self, stage: Path, source_id: str, affected_pages: list[Path]
+    ) -> None:
+        self._validate_annotations(stage)
+        self._validate_historical_citations(stage)
+        citation_pages = self._citation_pages_for_source_ids(
+            self._published_derivative_source_ids()
+        )
+        paper_pages = list((stage / self.page_prefix).glob("*.md"))
+        topic_pages = list((stage / self.topic_prefix).glob("*.md"))
+        analysis_pages = list((stage / "analyses").glob("*.md"))
+        for page_path in paper_pages:
+            self._validate_page(page_path, citation_pages, required_source=None)
+        for page_path in topic_pages:
+            self._validate_topic_page(page_path, citation_pages)
+        for page_path in analysis_pages:
+            self._validate_existing_filed_analysis_page(page_path, citation_pages)
+        pages = [*paper_pages, *topic_pages, *analysis_pages]
+        self._validate_wikilinks(stage, pages)
+        marker = f"<!-- researchos: withdrawn-source: {source_id} -->"
+        if any(marker not in page_path.read_text(encoding="utf-8") for page_path in affected_pages):
+            raise PublicationRejected("The staged withdrawal did not visibly mark all affected pages.")
+        self._run_git(stage, "add", "--all")
+        changed_pages = [
+            stage / name
+            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/", "analyses/"))
+            and name.endswith(".md")
+        ]
+        if set(changed_pages) != set(affected_pages):
+            raise PublicationRejected("The staged withdrawal changed an unexpected wiki page.")
+        index = (stage / "index.md").read_text(encoding="utf-8")
+        paper_link = f"[[papers/{source_id}]]"
+        if paper_link not in index or "(withdrawn)" not in index:
+            raise PublicationRejected("The content index does not mark the withdrawn paper.")
+        latest_entry = re.split(r"\n(?=## \[)", (stage / "log.md").read_text(encoding="utf-8"))[-1]
+        if "withdrawal" not in latest_entry.casefold() or source_id not in latest_entry:
+            raise PublicationRejected("The activity log does not describe the withdrawal.")
+        for page_path in affected_pages:
+            link = f"[[{page_path.relative_to(stage).with_suffix('').as_posix()}]]"
+            if link not in latest_entry:
+                raise PublicationRejected("The activity log omits an affected wiki page.")
+        tracked_names = self._run_git(stage, "ls-files")
+        prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
+        if any(part in tracked_names.lower() for part in prohibited):
+            raise PublicationRejected("Source artifacts cannot enter wiki Git history.")
 
     def _copy_fixed_snapshot(self) -> Path:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -2284,7 +2513,7 @@ class ResearchService:
     def stream(self, message: str) -> Iterator[dict[str, str]]:
         """Yield only safe application states while the worker is still running."""
 
-        request, published_sources = self._request(message)
+        request, published_sources, research_vault = self._request(message)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", dir=self.runtime_dir, delete=False
@@ -2322,6 +2551,7 @@ class ResearchService:
                     external_sources,
                     gap,
                     request["pending_sources"],
+                    request["withdrawn_sources"],
                 )
                 self.state.append_exchange(
                     message,
@@ -2335,27 +2565,51 @@ class ResearchService:
                 yield {"type": "complete", "content": rendered}
         finally:
             request_path.unlink(missing_ok=True)
+            shutil.rmtree(research_vault, ignore_errors=True)
 
-    def _request(self, message: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    def _request(
+        self, message: str
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], Path]:
         published = PublishedWiki(self.vault)
         source_records = self.sources.sources()
         published_sources = self._snapshot_sources(published)
+        withdrawn_sources = [
+            {
+                "source_id": source["source_id"],
+                "title": AtomicWikiPublisher._effective_metadata(source)["title"],
+            }
+            for source in source_records
+            if source.get("job", {}).get("published")
+            and source.get("withdrawal", {}).get("status") in {"pending", "withdrawn"}
+        ]
+        withdrawn_ids = {source["source_id"] for source in withdrawn_sources}
+        research_pages = [
+            wiki_page
+            for wiki_page in published.pages
+            if not self._page_uses_withdrawn_evidence(wiki_page, withdrawn_ids)
+        ]
+        research_vault = self._create_research_snapshot(research_pages)
+        safe_thread = [
+            message
+            for message in self.state.messages()
+            if not any(source_id in message["content"] for source_id in withdrawn_ids)
+        ]
         request = {
             "operation": "research",
             "message": message,
-            "thread": self.state.messages(),
+            "thread": safe_thread,
             # The resolved target freezes this turn to one fully published revision,
             # even if an ingest swaps the public vault symlink while chat runs.
-            "published_vault": str(published.vault.resolve()),
-            "index_path": str(published.vault / "index.md"),
+            "published_vault": str(research_vault.resolve()),
+            "index_path": str(research_vault / "index.md"),
             "pages": [
                 {
                     "path": page.path,
-                    "file": str(published.vault / f"{page.path}.md"),
+                    "file": str(research_vault / f"{page.path}.md"),
                     "links": sorted(extract_wikilinks(page.body)),
                     "backlinks": sorted(backlink.path for backlink in published.backlinks(page)),
                 }
-                for page in published.pages
+                for page in research_pages
             ],
             "derivatives": [
                 {
@@ -2374,15 +2628,45 @@ class ResearchService:
                 if source["source_id"] not in published_sources
                 and source["job"].get("status") in {"queued", "processing"}
             ],
+            "withdrawn_sources": withdrawn_sources,
             "required_skill": "LLM Wiki query",
             "external_research_policy": (
                 "Use live web research only when the published lab evidence is "
                 "insufficient. Name the lab-evidence gap and return external "
                 "citations separately. Never write external results into the vault "
-                "or source storage."
+                "or source storage. Withdrawn sources are historical context only: "
+                "do not read, cite, or use them to answer the question."
             ),
         }
-        return request, published_sources
+        return request, published_sources, research_vault
+
+    def _create_research_snapshot(self, pages: list[PublishedWikiPage]) -> Path:
+        """Expose chat only to pages with no withdrawn evidence citations."""
+
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = Path(tempfile.mkdtemp(prefix="research-snapshot-", dir=self.runtime_dir))
+        try:
+            for wiki_page in pages:
+                target = snapshot / f"{wiki_page.path}.md"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(wiki_page.contents, encoding="utf-8")
+            index = "# ResearchOS research snapshot\n\n## Available pages\n" + "".join(
+                f"- [[{wiki_page.path}]] — {wiki_page.title}\n" for wiki_page in pages
+            )
+            (snapshot / "index.md").write_text(index, encoding="utf-8")
+            return snapshot
+        except Exception:
+            shutil.rmtree(snapshot, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _page_uses_withdrawn_evidence(
+        wiki_page: PublishedWikiPage, withdrawn_ids: set[str]
+    ) -> bool:
+        citation_sources = set(
+            re.findall(r"— source ([0-9a-f]{64}) — PDF p\. \d+", wiki_page.contents)
+        )
+        return bool(citation_sources & withdrawn_ids)
 
     def _snapshot_sources(self, published: PublishedWiki) -> dict[str, dict[str, str]]:
         """Resolve evidence from the same immutable vault revision as its wiki pages."""
@@ -2394,6 +2678,9 @@ class ResearchService:
                 continue
             for source_id in supporting_sources:
                 if not isinstance(source_id, str) or not re.fullmatch(r"[0-9a-f]{64}", source_id):
+                    continue
+                source = self.sources.source(source_id)
+                if source and source.get("withdrawal", {}).get("status") in {"pending", "withdrawn"}:
                     continue
                 derivative = self._latest_derivative(source_id)
                 if derivative is None:
@@ -2468,6 +2755,7 @@ class ResearchService:
         external_sources: list[dict[str, str]],
         gap: str | None,
         pending_sources: list[dict[str, str]],
+        withdrawn_sources: list[dict[str, str]],
     ) -> str:
         evidence = "\n".join(
             f"- {source['title']} — "
@@ -2487,8 +2775,18 @@ class ResearchService:
             if external_sources and gap is not None
             else ""
         )
+        withdrawal_notice = (
+            "\n\n## Withdrawn material\nWithdrawn material exists in this lab and "
+            "was excluded from this research answer.\n"
+            + "\n".join(
+                f"- {source['title']} — source {source['source_id']}"
+                for source in withdrawn_sources
+            )
+            if withdrawn_sources
+            else ""
+        )
         return (
-            f"{answer}\n\n## Lab sources\n{evidence}{external_sections}"
+            f"{answer}\n\n## Lab sources\n{evidence}{external_sections}{withdrawal_notice}"
             f"\n\n## Source availability\n{pending}"
         )
 
@@ -2505,6 +2803,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     sources = SourceCatalog(settings.data_dir)
     worker = CodexWorker(settings)
     publisher = AtomicWikiPublisher(sources, settings)
+    publisher.recover_pending_withdrawals()
     ingest_worker = IngestWorker(sources, settings, publisher)
     ingest_service = IngestWorkerService(ingest_worker)
     research_service = ResearchService(state, sources, worker, publisher.vault)
@@ -2545,6 +2844,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f' <a href="/wiki/papers/{escape(source["source_id"])}">'
                     "Open paper page</a>"
                 )
+            withdrawal_state = source.get("withdrawal", {}).get("status")
+            withdrawal = (
+                f" — <strong>{escape(withdrawal_state)}</strong>"
+                if withdrawal_state in {"pending", "withdrawn"}
+                else ""
+            )
             retry = ""
             if job["status"] in {"failed", "unsupported"}:
                 retry = (
@@ -2578,11 +2883,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f'{escape(doi, quote=True)}"></label> '
                     '<button>Save authoritative metadata</button></form>'
                 )
+            withdrawal_form = ""
+            if job.get("published") and withdrawal_state is None:
+                withdrawal_form = (
+                    f'<form action="/library/sources/{escape(source["source_id"])}/withdraw" '
+                    'method="post"><button>Withdraw source</button></form>'
+                )
+            remove_form = ""
+            if not job.get("published") and job.get("status") != "processing":
+                remove_form = (
+                    f'<form action="/library/sources/{escape(source["source_id"])}" '
+                    'method="post"><button>Remove pre-ingest upload</button></form>'
+                )
             return (
                 f"<li><code>{escape(source['source_id'])}</code> — "
                 f"{escape(effective_metadata['title'])} "
                 f"(<strong>{escape(job['status'])}</strong>; {metadata_state})"
-                f"{revision}{error}{paper_link}{retry}{correction}</li>"
+                f"{withdrawal}{revision}{error}{paper_link}{retry}{correction}"
+                f"{withdrawal_form}{remove_form}</li>"
             )
 
         entries = "".join(render_source(source) for source in sources.sources())
@@ -2640,6 +2958,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (PublicationRejected, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"source_id": source_id, "metadata": source["metadata"]}
+
+    @app.post("/api/sources/{source_id}/withdraw")
+    def withdraw_source(source_id: str) -> dict[str, Any]:
+        try:
+            sources.begin_withdrawal(source_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown source.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            publisher.publish_withdrawal(source_id)
+        except PublicationRejected as error:
+            sources.cancel_withdrawal(source_id)
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            source = sources.complete_withdrawal(source_id)
+        except (OSError, ValueError) as error:
+            # A pending state is deliberately safer than active evidence: startup
+            # reconciliation completes it if the committed marker is already live.
+            raise HTTPException(status_code=409, detail="Withdrawal is pending recovery.") from error
+        return {"source_id": source_id, "withdrawal": source["withdrawal"]}
+
+    @app.delete("/api/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def remove_pre_ingest_source(source_id: str) -> None:
+        try:
+            sources.remove_pre_ingest(source_id)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown source.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/library/sources/{source_id}/withdraw")
+    def withdraw_source_from_library(source_id: str) -> RedirectResponse:
+        withdraw_source(source_id)
+        return RedirectResponse("/library", status_code=303)
+
+    @app.post("/library/sources/{source_id}")
+    def remove_pre_ingest_source_from_library(source_id: str) -> RedirectResponse:
+        remove_pre_ingest_source(source_id)
+        return RedirectResponse("/library", status_code=303)
 
     @app.post("/library/sources/{source_id}/metadata")
     def correct_source_metadata_from_library(
