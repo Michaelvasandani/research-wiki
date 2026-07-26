@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import pytest
 
+from tests.test_markdown_derivatives import text_pdf
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -45,6 +47,23 @@ def post_form(url: str, values: dict[str, str]) -> tuple[int, str]:
         return response.status, response.read().decode()
 
 
+def post_pdf(url: str, content: bytes) -> tuple[int, str]:
+    boundary = "researchos-compose-upload"
+    payload = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="compose.pdf"\r\n'
+        "Content-Type: application/pdf\r\n\r\n"
+    ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    request = Request(
+        url,
+        data=payload,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urlopen(request, timeout=2) as response:  # noqa: S310 - localhost test server
+        return response.status, response.read().decode()
+
+
 @pytest.mark.compose
 def test_compose_shell_persists_state_and_exposes_fake_codex(tmp_path: Path) -> None:
     if not docker_is_available():
@@ -55,6 +74,7 @@ def test_compose_shell_persists_state_and_exposes_fake_codex(tmp_path: Path) -> 
     environment = os.environ | {
         "RESEARCHOS_DATA_HOST_DIR": str(tmp_path / "data"),
         "RESEARCHOS_PORT": str(port),
+        "FAKE_CODEX_MODE": "network",
     }
     compose = ["docker", "compose", "-p", project]
     base_url = f"http://127.0.0.1:{port}"
@@ -88,6 +108,22 @@ def test_compose_shell_persists_state_and_exposes_fake_codex(tmp_path: Path) -> 
             "events": [{"type": "progress", "message": "Checking the local worker"}],
             "output": "fake Codex is ready",
         }
+
+        status, upload = post_pdf(
+            f"{base_url}/api/sources",
+            text_pdf("The Compose writer publishes a cited paper page."),
+        )
+        source_id = json.loads(upload)["source_id"]
+        assert status == 201
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            _, library = get(f"{base_url}/library")
+            if source_id in library and "completed" in library:
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("Compose writer did not publish the uploaded paper")
+        assert source_id in get(f"{base_url}/wiki")[1]
 
         subprocess.run([*compose, "restart"], cwd=ROOT, env=environment, check=True)
         deadline = time.monotonic() + 30

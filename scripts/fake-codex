@@ -9,25 +9,138 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 import sys
 
 
 def main() -> int:
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
-    if len(sys.argv) != 2 or sys.argv[1] != "probe":
-        print("unsupported fake Codex command", file=sys.stderr)
-        return 64
     if mode == "failure":
         print("controlled fake failure", file=sys.stderr)
         return 17
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode != "success":
+    if mode not in {"success", "invalid", "annotation", "artifact", "network"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
-    print(json.dumps({"type": "progress", "message": "Checking the local worker"}))
-    print(json.dumps({"type": "result", "output": "fake Codex is ready"}))
+    if sys.argv[1:] == ["probe"]:
+        print(json.dumps({"type": "progress", "message": "Checking the local worker"}))
+        print(json.dumps({"type": "result", "output": "fake Codex is ready"}))
+        return 0
+    if len(sys.argv) != 3 or sys.argv[1] != "ingest":
+        print("unsupported fake Codex command", file=sys.stderr)
+        return 64
+    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "disabled":
+        print("writer networking was not disabled", file=sys.stderr)
+        return 65
+    request = json.loads(open(sys.argv[2], encoding="utf-8").read())
+    source_id = request["source_id"]
+    title = request["metadata"].get("title") or "Untitled paper"
+    vault = os.path.abspath(request["staged_vault"])
+    if not request.get("evidence_is_untrusted") or not os.path.abspath(sys.argv[2]).startswith(vault):
+        print("invalid staged ingest request", file=sys.stderr)
+        return 66
+    if mode == "network":
+        if sys.platform.startswith("linux"):
+            capabilities = next(
+                (
+                    line.split(":", 1)[1].strip()
+                    for line in open("/proc/self/status", encoding="utf-8")
+                    if line.startswith("CapEff:")
+                ),
+                None,
+            )
+            if capabilities != "0000000000000000":
+                print("writer retained Linux capabilities", file=sys.stderr)
+                return 69
+        try:
+            socket.create_connection(("198.51.100.1", 9), timeout=0.1)
+        except OSError:
+            # A denied socket and a network namespace with no route are both
+            # successful evidence that this writer cannot reach the network.
+            pass
+        else:
+            print("writer unexpectedly reached the network", file=sys.stderr)
+            return 68
+    page_directory = os.path.join(vault, "papers")
+    os.makedirs(page_directory, exist_ok=True)
+    citation = f"source-{source_id[:12]}-p1"
+    page = f'''---
+page_type: paper
+id: paper-{source_id}
+title: "{title}"
+aliases: []
+supporting_sources:
+  - {source_id}
+created: 2026-07-26
+possible_duplicates: []
+---
+# {title}
+
+## Bibliographic metadata
+Title: {title} [^{citation}]
+
+## Summary
+This paper has been ingested as untrusted evidence. [^{citation}]
+
+## Key findings
+The paper reports a result that requires source-level review. [^{citation}]
+
+## Methods
+The method is recorded from the source derivative. [^{citation}]
+
+## Datasets
+Dataset details remain limited to the cited paper. [^{citation}]
+
+## Limitations
+The paper's limitations require cautious interpretation. [^{citation}]
+
+## Related pages
+No related pages yet.
+
+## Contradictions and open questions
+No contradictions identified.
+
+## Evidence citations
+[^{citation}]: {title} — source {source_id} — PDF p. 1
+
+## Researcher annotations
+<!-- researcher-annotations:start -->
+<!-- researcher-annotations:end -->
+'''
+    open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(page)
+    with open(os.path.join(vault, "index.md"), "a", encoding="utf-8") as index:
+        index.write(f"- [[papers/{source_id}]] — {title}\n")
+    with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
+        log.write(
+            f"\n## [2026-07-26] ingest | {title}\n"
+            f"Source: {source_id}\nAffected pages: [[papers/{source_id}]]\n"
+            "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
+        )
+    if mode == "invalid":
+        open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(
+            "The staged writer intentionally returned malformed content.\n"
+        )
+    if mode == "annotation":
+        for filename in os.listdir(page_directory):
+            if filename != f"{source_id}.md" and filename.endswith(".md"):
+                path = os.path.join(page_directory, filename)
+                contents = open(path, encoding="utf-8").read()
+                open(path, "w", encoding="utf-8").write(
+                    contents.replace(
+                        "<!-- researcher-annotations:start -->\n",
+                        "<!-- researcher-annotations:start -->\nunauthorized edit\n",
+                    )
+                )
+                break
+    if mode == "artifact":
+        artifact = os.path.join(vault, "source.pdf")
+        open(artifact, "wb").write(b"not a permitted wiki artifact")
+        subprocess.run(["git", "-C", vault, "add", "source.pdf"], check=True)
+    print(json.dumps({"type": "progress", "message": "Writing staged paper page"}))
+    print(json.dumps({"type": "result", "output": "staged ingest complete"}))
     return 0
 
 

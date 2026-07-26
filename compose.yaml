@@ -1,6 +1,10 @@
 services:
   researchos:
     build: .
+    cap_add:
+      # Bubblewrap needs this only to create the writer namespaces. Its executed
+      # child is in a new user namespace and explicitly drops every capability.
+      - SYS_ADMIN
     ports:
       - "127.0.0.1:${RESEARCHOS_PORT:-8000}:8000"
     volumes:
@@ -8,3 +12,4 @@ services:
     environment:
       RESEARCHOS_DATA_DIR: /data
       CODEX_COMMAND: ${CODEX_COMMAND:-/app/scripts/fake-codex}
+      FAKE_CODEX_MODE: ${FAKE_CODEX_MODE:-success}
