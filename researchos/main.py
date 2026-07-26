@@ -86,7 +86,13 @@ class FileState:
             for message in messages
         ]
 
-    def append_exchange(self, message: str, answer: str) -> None:
+    def append_exchange(
+        self,
+        message: str,
+        answer: str,
+        *,
+        filing_candidate: dict[str, Any] | None = None,
+    ) -> None:
         messages = self.messages()
         messages.extend(
             [
@@ -94,7 +100,33 @@ class FileState:
                 {"role": "assistant", "content": answer},
             ]
         )
-        self._write({"messages": messages})
+        content: dict[str, Any] = {"messages": messages}
+        if filing_candidate is not None:
+            content["filing_candidate"] = filing_candidate
+        self._write(content)
+
+    def filing_candidate(self) -> dict[str, Any] | None:
+        if not self.path.exists():
+            return None
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        candidate = data.get("filing_candidate")
+        if not isinstance(candidate, dict):
+            return None
+        answer = candidate.get("answer")
+        source_ids = candidate.get("source_ids")
+        external_sources = candidate.get("external_sources")
+        if (
+            not isinstance(answer, str)
+            or not isinstance(source_ids, list)
+            or not all(isinstance(source_id, str) for source_id in source_ids)
+            or not isinstance(external_sources, list)
+        ):
+            return None
+        return {
+            "answer": answer,
+            "source_ids": source_ids,
+            "external_sources": external_sources,
+        }
 
     def _write(self, content: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile(
@@ -707,6 +739,16 @@ class CodexWorker:
             writable_directory=request_path.parent,
         )
 
+    def file_analysis(self, request_path: Path) -> dict[str, Any]:
+        """Run an explicit filed-analysis writer against a staged vault only."""
+
+        return self._run(
+            "file-analysis",
+            str(request_path),
+            network_disabled=True,
+            writable_directory=request_path.parent,
+        )
+
     def research(self, request_path: Path) -> dict[str, Any]:
         """Run chat with a read-only view of one published wiki snapshot."""
 
@@ -1031,6 +1073,13 @@ class PublicationRejected(Exception):
     """A staged wiki result does not satisfy durable publication invariants."""
 
 
+def filed_analysis_path(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-")
+    if not slug:
+        raise PublicationRejected("A filed analysis needs a title.")
+    return f"analyses/{slug}"
+
+
 class AtomicWikiPublisher:
     """Stages, validates, and publishes one complete wiki update as one commit."""
 
@@ -1123,6 +1172,73 @@ class AtomicWikiPublisher:
             if stage.exists():
                 shutil.rmtree(stage)
             raise
+
+    def publish_filed_analysis(
+        self, title: str, analysis: str, source_ids: list[str]
+    ) -> str:
+        """Publish an explicitly requested, multi-source analysis as one wiki update."""
+
+        analysis_path = filed_analysis_path(title)
+        unique_source_ids = sorted(set(source_ids))
+        if len(unique_source_ids) < 2 or len(unique_source_ids) != len(source_ids):
+            raise PublicationRejected(
+                "A filed cross-paper analysis needs two distinct ingested sources."
+            )
+        supporting_sources: list[dict[str, str]] = []
+        for source_id in unique_source_ids:
+            source = self.sources.source(source_id)
+            job = self.sources.job(source_id)
+            derivative = job.get("derivative") if job else None
+            if (
+                source is None
+                or not job
+                or not job.get("published")
+                or not isinstance(derivative, str)
+            ):
+                raise PublicationRejected(
+                    "A filed analysis may use only published ingested sources."
+                )
+            supporting_sources.append(
+                {
+                    "source_id": source_id,
+                    "title": self._effective_metadata(source)["title"],
+                    "derivative_path": str(self.sources.source_dir.parent / derivative),
+                }
+            )
+        base_head = self._head(self.vault)
+        stage = self._copy_fixed_snapshot()
+        try:
+            request_path = stage / ".researchos-file-analysis.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "operation": "file-analysis",
+                        "title": title,
+                        "analysis": analysis,
+                        "analysis_path": analysis_path,
+                        "supporting_sources": supporting_sources,
+                        "staged_vault": str(stage),
+                        "required_skill": "LLM Wiki",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.codex.file_analysis(request_path)
+            request_path.unlink(missing_ok=True)
+            self._validate_filed_analysis(stage, title, analysis_path, unique_source_ids)
+            self._commit(stage, analysis_path, operation="filed analysis")
+            if self._head(self.vault) != base_head:
+                raise PublicationRejected(
+                    "The live wiki changed while the analysis was staged."
+                )
+            self._replace_live_vault(stage)
+        except Exception:
+            if stage.exists():
+                shutil.rmtree(stage)
+            raise
+        return analysis_path
 
     def _apply_metadata_correction(
         self, stage: Path, source_id: str, metadata: dict[str, Any]
@@ -1300,6 +1416,175 @@ class AtomicWikiPublisher:
         prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
         if any(part in tracked_names.lower() for part in prohibited):
             raise PublicationRejected("Source artifacts cannot enter wiki Git history.")
+
+    def _validate_filed_analysis(
+        self, stage: Path, title: str, analysis_path: str, source_ids: list[str]
+    ) -> None:
+        self._validate_annotations(stage)
+        self._validate_historical_citations(stage)
+        paper_pages = list((stage / self.page_prefix).glob("*.md"))
+        topic_pages = list((stage / self.topic_prefix).glob("*.md"))
+        analysis_pages = list((stage / "analyses").glob("*.md"))
+        expected_page = stage / f"{analysis_path}.md"
+        if expected_page not in analysis_pages:
+            raise PublicationRejected("The staged writer did not create the filed analysis page.")
+        pages = [*paper_pages, *topic_pages, *analysis_pages]
+        citation_pages = self._citation_pages_for_source_ids(
+            self._published_derivative_source_ids()
+        )
+        for page_path in paper_pages:
+            self._validate_page(page_path, citation_pages, required_source=None)
+        for topic_path in topic_pages:
+            self._validate_topic_page(topic_path, citation_pages)
+        self._validate_filed_analysis_page(
+            expected_page, title, source_ids, citation_pages
+        )
+        for page_path in analysis_pages:
+            if page_path != expected_page:
+                self._validate_existing_filed_analysis_page(page_path, citation_pages)
+        self._validate_wikilinks(stage, pages)
+        self._run_git(stage, "add", "--all")
+        changed_pages = [
+            stage / name
+            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/", "analyses/"))
+            and name.endswith(".md")
+        ]
+        if expected_page not in changed_pages:
+            raise PublicationRejected("The staged writer did not update the filed analysis page.")
+        self._validate_filed_index_and_log(stage, expected_page, changed_pages)
+        tracked_names = self._run_git(stage, "ls-files")
+        prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
+        if any(part in tracked_names.lower() for part in prohibited):
+            raise PublicationRejected("Source artifacts cannot enter wiki Git history.")
+
+    def _validate_filed_analysis_page(
+        self,
+        page_path: Path,
+        title: str | None,
+        source_ids: list[str],
+        citation_pages: dict[str, set[int]],
+    ) -> None:
+        contents = page_path.read_text(encoding="utf-8")
+        required_metadata = (
+            "page_type: filed-analysis",
+            "id: analysis-",
+            f"title: {json.dumps(title)}" if title is not None else "title:",
+            "aliases:",
+            "supporting_sources:",
+            "created:",
+            "possible_duplicates:",
+        )
+        required_sections = (
+            "## Summary",
+            "## Cross-paper analysis",
+            "## Related pages",
+            "## Evidence citations",
+            "## Researcher annotations\n<!-- researcher-annotations:start -->",
+            "<!-- researcher-annotations:end -->",
+        )
+        if not contents.startswith("---\n") or any(
+            item not in contents for item in required_metadata
+        ):
+            raise PublicationRejected(f"{page_path.name} has invalid filed-analysis metadata.")
+        if any(section not in contents for section in required_sections):
+            raise PublicationRejected(f"{page_path.name} is missing a required analysis section.")
+        self._validate_citations_and_claims(page_path, citation_pages)
+        frontmatter = contents.split("---\n", 2)[1]
+        supporting_sources = set(
+            re.findall(r"^  - ([0-9a-f]{64})$", frontmatter, flags=re.MULTILINE)
+        )
+        if supporting_sources != set(source_ids):
+            raise PublicationRejected(
+                f"{page_path.name} must identify exactly the supporting ingested sources."
+            )
+        citation_sources = {
+            source_id
+            for _, _, source_id, _ in re.findall(
+                r"^\[\^([^]]+)\]: (.+?) — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
+                contents,
+                flags=re.MULTILINE,
+            )
+        }
+        if citation_sources != set(source_ids):
+            raise PublicationRejected(
+                f"{page_path.name} may cite only its supporting ingested sources."
+            )
+        links = set(re.findall(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", contents))
+        if any(f"papers/{source_id}" not in links for source_id in source_ids):
+            raise PublicationRejected(
+                f"{page_path.name} must explicitly link every supporting paper."
+            )
+
+    def _validate_existing_filed_analysis_page(
+        self, page_path: Path, citation_pages: dict[str, set[int]]
+    ) -> None:
+        metadata, _ = parse_frontmatter(page_path.read_text(encoding="utf-8"))
+        supporting_sources = metadata.get("supporting_sources")
+        if (
+            not isinstance(supporting_sources, list)
+            or len(supporting_sources) < 2
+            or len(set(supporting_sources)) != len(supporting_sources)
+            or not all(re.fullmatch(r"[0-9a-f]{64}", source_id) for source_id in supporting_sources)
+        ):
+            raise PublicationRejected(
+                f"{page_path.name} has invalid filed-analysis supporting sources."
+            )
+        self._validate_filed_analysis_page(
+            page_path, None, supporting_sources, citation_pages
+        )
+
+    def _validate_filed_index_and_log(
+        self, stage: Path, page_path: Path, changed_pages: list[Path]
+    ) -> None:
+        index = (stage / "index.md").read_text(encoding="utf-8")
+        log = (stage / "log.md").read_text(encoding="utf-8")
+        expected_link = f"[[{page_path.relative_to(stage).with_suffix('').as_posix()}]]"
+        if expected_link not in index:
+            raise PublicationRejected("The content index does not list the filed analysis.")
+        latest_entry = re.split(r"\n(?=## \[)", log)[-1]
+        if "filed analysis" not in latest_entry.casefold() or expected_link not in latest_entry:
+            raise PublicationRejected("The activity log does not describe the filed analysis.")
+        for changed_page in changed_pages:
+            changed_link = f"[[{changed_page.relative_to(stage).with_suffix('').as_posix()}]]"
+            if changed_link not in index:
+                raise PublicationRejected("The content index does not list an affected wiki page.")
+            if changed_link not in latest_entry:
+                raise PublicationRejected("The activity log does not describe an affected wiki page.")
+
+    def _citation_pages_for_source_ids(self, source_ids: list[str]) -> dict[str, set[int]]:
+        pages_by_source: dict[str, set[int]] = {}
+        for source_id in source_ids:
+            job = self.sources.job(source_id)
+            derivative = job.get("derivative") if job else None
+            if not isinstance(derivative, str):
+                raise PublicationRejected(
+                    "A filed analysis is missing an ingested source derivative."
+                )
+            path = self.sources.source_dir.parent / derivative
+            if not path.exists():
+                raise PublicationRejected(
+                    "A filed analysis is missing an ingested source derivative."
+                )
+            pages = {
+                int(number)
+                for number in re.findall(
+                    r"<!-- pdf-page: (\d+) -->", path.read_text(encoding="utf-8")
+                )
+            }
+            if not pages:
+                raise PublicationRejected(
+                    "A filed analysis source has no physical PDF pages."
+                )
+            pages_by_source[source_id] = pages
+        return pages_by_source
+
+    def _published_derivative_source_ids(self) -> list[str]:
+        return sorted(
+            source_id
+            for source_id, job in self.sources.jobs().items()
+            if job.get("published") and isinstance(job.get("derivative"), str)
+        )
 
     def _validate_revision_links(
         self, stage: Path, source_id: str, revision_of: str | None
@@ -2038,7 +2323,15 @@ class ResearchService:
                     gap,
                     request["pending_sources"],
                 )
-                self.state.append_exchange(message, rendered)
+                self.state.append_exchange(
+                    message,
+                    rendered,
+                    filing_candidate={
+                        "answer": answer,
+                        "source_ids": sorted(cited_ids),
+                        "external_sources": external_sources,
+                    },
+                )
                 yield {"type": "complete", "content": rendered}
         finally:
             request_path.unlink(missing_ok=True)
@@ -2413,6 +2706,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             f"""<p>The single persisted research thread reads the latest published lab wiki and may use separately labelled external research when the lab collection has a gap.</p>{transcript}
 <p id="research-status" aria-live="polite"></p>
 <form id="research-form" action="/research/messages" method="post"><label>Message <input name="message" required></label><button>Ask research</button></form>
+<form id="file-analysis-form" action="/research/analyses" method="post"><label>Analysis title <input name="title" required></label><button>File latest supported analysis</button></form>
 <script>
 (() => {{
   const form = document.querySelector("#research-form");
@@ -2465,6 +2759,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/research/thread")
     def research_thread() -> dict[str, list[dict[str, str]]]:
         return {"messages": state.messages()}
+
+    def file_latest_analysis(title: str) -> dict[str, str]:
+        candidate = state.filing_candidate()
+        if candidate is None:
+            raise HTTPException(status_code=409, detail="No completed research analysis is available to file.")
+        if candidate["external_sources"]:
+            raise HTTPException(
+                status_code=409,
+                detail="External research must be ingested before it can support a filed analysis.",
+            )
+        try:
+            analysis_path = publisher.publish_filed_analysis(
+                title.strip(), candidate["answer"], candidate["source_ids"]
+            )
+        except PublicationRejected as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"path": analysis_path, "title": title.strip()}
+
+    @app.post("/api/research/analyses", status_code=status.HTTP_201_CREATED)
+    def file_research_analysis(payload: dict[str, Any]) -> dict[str, str]:
+        title = payload.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise HTTPException(status_code=422, detail="A filed analysis needs a title.")
+        return file_latest_analysis(title)
+
+    @app.post("/research/analyses")
+    def file_research_analysis_from_page(title: str = Form()) -> RedirectResponse:
+        file_latest_analysis(title)
+        return RedirectResponse("/wiki", status_code=303)
 
     @app.post("/api/research/messages")
     def stream_research_message(payload: dict[str, Any]) -> StreamingResponse:

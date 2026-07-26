@@ -108,6 +108,102 @@ def research(request_path: str, mode: str) -> int:
     return 0
 
 
+def file_analysis(request_path: str, mode: str) -> int:
+    if os.environ.get("RESEARCHOS_NETWORK_ACCESS") != "disabled":
+        print("filed-analysis writer networking was not disabled", file=sys.stderr)
+        return 73
+    request = json.loads(open(request_path, encoding="utf-8").read())
+    vault = os.path.abspath(request["staged_vault"])
+    if not os.path.abspath(request_path).startswith(vault):
+        print("invalid staged filed-analysis request", file=sys.stderr)
+        return 74
+    title = request["title"]
+    analysis_path = request["analysis_path"]
+    sources = request["supporting_sources"]
+    if not isinstance(sources, list) or len(sources) < 2:
+        print("filed analysis needs two sources", file=sys.stderr)
+        return 75
+    for source in sources:
+        open(source["derivative_path"], encoding="utf-8").read()
+    source_ids = [source["source_id"] for source in sources]
+    citations = [f"source-{source_id[:12]}-p1" for source_id in source_ids]
+    paper_links = "\n".join(
+        f"[[papers/{source['source_id']}|{source['title']}]] [^{citation}]"
+        for source, citation in zip(sources, citations)
+    )
+    citation_definitions = "\n".join(
+        f"[^{citation}]: {source['title']} — source {source['source_id']} — PDF p. 1"
+        for source, citation in zip(sources, citations)
+    )
+    support_lines = "\n".join(f"  - {source_id}" for source_id in source_ids)
+    page_path = os.path.join(vault, f"{analysis_path}.md")
+    os.makedirs(os.path.dirname(page_path), exist_ok=True)
+    page = f'''---
+page_type: filed-analysis
+id: analysis-{analysis_path.rsplit('/', 1)[-1]}
+title: {json.dumps(title)}
+aliases: []
+supporting_sources:
+{support_lines}
+created: 2026-07-26
+possible_duplicates: []
+---
+# {title}
+
+## Summary
+This filed analysis preserves a cross-paper synthesis supported by the listed ingested sources. [^{citations[0]}] [^{citations[1]}]
+
+## Cross-paper analysis
+The supporting papers contribute distinct evidence that should remain explicitly cited rather than merged into a single-source summary. [^{citations[0]}] [^{citations[1]}]
+
+## Related pages
+{paper_links}
+
+## Evidence citations
+{citation_definitions}
+
+## Researcher annotations
+<!-- researcher-annotations:start -->
+<!-- researcher-annotations:end -->
+'''
+    if mode == "file-invalid":
+        page = "The filed analysis is intentionally malformed.\n"
+    open(page_path, "w", encoding="utf-8").write(page)
+    with open(os.path.join(vault, "index.md"), "a", encoding="utf-8") as index:
+        index.write(f"- [[{analysis_path}]] — {title}\n")
+    with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
+        affected = f"[[{analysis_path}]], " + ", ".join(
+            f"[[papers/{source_id}]]" for source_id in source_ids
+        )
+        log.write(
+            f"\n## [2026-07-26] filed analysis | {title}\n"
+            f"Sources: {', '.join(source_ids)}\nAffected pages: {affected}\n"
+            "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
+        )
+    if mode == "file-annotation":
+        paper_directory = os.path.join(vault, "papers")
+        filename = next(filename for filename in os.listdir(paper_directory) if filename.endswith(".md"))
+        path = os.path.join(paper_directory, filename)
+        contents = open(path, encoding="utf-8").read()
+        open(path, "w", encoding="utf-8").write(
+            contents.replace(
+                "<!-- researcher-annotations:start -->\n",
+                "<!-- researcher-annotations:start -->\nunauthorized edit\n",
+            )
+        )
+    if mode == "file-corrupt-existing":
+        paper_directory = os.path.join(vault, "papers")
+        filename = next(filename for filename in os.listdir(paper_directory) if filename.endswith(".md"))
+        path = os.path.join(paper_directory, filename)
+        contents = open(path, encoding="utf-8").read()
+        open(path, "w", encoding="utf-8").write(
+            contents.replace("## Summary\n", "## Summary\nThis unsupported change must be rejected.\n")
+        )
+    print(json.dumps({"type": "progress", "message": "Writing staged filed analysis"}))
+    print(json.dumps({"type": "result", "output": "staged filed analysis complete"}))
+    return 0
+
+
 def main() -> int:
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
     if mode == "failure":
@@ -116,7 +212,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "file-invalid", "file-annotation", "file-corrupt-existing"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
@@ -125,6 +221,8 @@ def main() -> int:
         return 0
     if len(sys.argv) == 3 and sys.argv[1] == "research":
         return research(sys.argv[2], mode)
+    if len(sys.argv) == 3 and sys.argv[1] == "file-analysis":
+        return file_analysis(sys.argv[2], mode)
     if len(sys.argv) != 3 or sys.argv[1] != "ingest":
         print("unsupported fake Codex command", file=sys.stderr)
         return 64
