@@ -31,7 +31,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history"}:
+    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
@@ -47,6 +47,10 @@ def main() -> int:
     request = json.loads(open(sys.argv[2], encoding="utf-8").read())
     source_id = request["source_id"]
     title = request["metadata"].get("title") or "Untitled paper"
+    authors = request["metadata"].get("authors") or []
+    year = request["metadata"].get("year")
+    doi = request["metadata"].get("doi")
+    revision_of = request.get("revision_of")
     source_text = open(request["derivative_path"], encoding="utf-8").read().casefold()
     substantive_method = "method" in source_text
     current_direction = outcome_direction(source_text)
@@ -85,15 +89,29 @@ def main() -> int:
     existing_topic = (
         open(topic_path, encoding="utf-8").read() if os.path.exists(topic_path) else None
     )
+    parent_path = os.path.join(page_directory, f"{revision_of}.md") if revision_of else None
+    if parent_path and not os.path.exists(parent_path):
+        print("revision parent has not been published", file=sys.stderr)
+        return 67
     related_pages = (
         f"[[topics/research-methods|Research methods]] [^{citation}]"
         if substantive_method
         else "No related pages yet."
     )
+    if revision_of:
+        related_pages = f"[[papers/{revision_of}|Earlier revision]] [^{citation}]"
+    author_text = "; ".join(authors) if authors else "Not specified"
+    year_text = str(year) if year is not None else "Not specified"
+    doi_text = doi or "Not specified"
+    revision_metadata = (
+        f"Revision of: [[papers/{revision_of}|Earlier revision]] [^{citation}]\n"
+        if revision_of
+        else ""
+    )
     page = f'''---
 page_type: paper
 id: paper-{source_id}
-title: "{title}"
+title: {json.dumps(title)}
 aliases: []
 supporting_sources:
   - {source_id}
@@ -104,6 +122,10 @@ possible_duplicates: []
 
 ## Bibliographic metadata
 Title: {title} [^{citation}]
+Authors: {author_text} [^{citation}]
+Year: {year_text} [^{citation}]
+DOI: {doi_text} [^{citation}]
+{revision_metadata}
 
 ## Summary
 This paper has been ingested as untrusted evidence. [^{citation}]
@@ -134,6 +156,17 @@ No contradictions identified.
 <!-- researcher-annotations:end -->
 '''
     open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(page)
+    if revision_of:
+        parent = open(parent_path, encoding="utf-8").read()
+        revised_by = f"Revised by: [[papers/{source_id}|{title}]] [^{citation}]"
+        parent = parent.replace("No related pages yet.", revised_by)
+        if revised_by not in parent:
+            parent = parent.replace("## Related pages\n", f"## Related pages\n{revised_by}\n")
+        parent = parent.replace(
+            "\n## Researcher annotations\n",
+            f"\n[^{citation}]: {title} — source {source_id} — PDF p. 1\n\n## Researcher annotations\n",
+        )
+        open(parent_path, "w", encoding="utf-8").write(parent)
     existing_sources = (
         re.findall(r"— source ([0-9a-f]{64}) — PDF p\. \d+", existing_topic)
         if existing_topic
@@ -286,6 +319,8 @@ This substantive method topic accumulates evidence from two sources without coll
             index.write("- [[topics/research-method-variants]] — Research method variants\n")
     with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
         affected_pages = f"[[papers/{source_id}]]"
+        if revision_of:
+            affected_pages += f", [[papers/{revision_of}]]"
         if substantive_method:
             affected_pages += ", [[topics/research-methods]]"
         if possible_duplicate:
@@ -306,6 +341,11 @@ This substantive method topic accumulates evidence from two sources without coll
         open(topic_path, "w", encoding="utf-8").write(
             topic.replace(f"source {first_source}", f"source {source_id}")
         )
+    if mode == "missing-revision-link" and revision_of:
+        revision_path = os.path.join(page_directory, f"{source_id}.md")
+        revision = open(revision_path, encoding="utf-8").read()
+        revision = revision.replace(f"[[papers/{revision_of}|Earlier revision]] ", "")
+        open(revision_path, "w", encoding="utf-8").write(revision)
     if mode == "annotation":
         for filename in os.listdir(page_directory):
             if filename != f"{source_id}.md" and filename.endswith(".md"):

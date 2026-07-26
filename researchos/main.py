@@ -100,10 +100,16 @@ class SourceCatalog:
         self.source_dir.mkdir(parents=True, exist_ok=True)
         self.job_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def upload(self, filename: str, content: bytes) -> dict[str, Any]:
+    def upload(
+        self, filename: str, content: bytes, *, revision_of: str | None = None
+    ) -> dict[str, Any]:
         source_id = sha256(content).hexdigest()
         sources = self._read_manifest(self.manifest_path, "sources")
         jobs = self._read_manifest(self.job_path, "jobs")
+        if revision_of is not None and revision_of not in sources:
+            raise KeyError(revision_of)
+        if revision_of == source_id:
+            raise ValueError("A source cannot be a revision of itself.")
         source = sources.get(source_id)
         if source is None:
             source = {
@@ -113,20 +119,66 @@ class SourceCatalog:
             }
             sources[source_id] = source
             (self.source_dir / f"{source_id}.pdf").write_bytes(content)
-            self._write_manifest(self.manifest_path, "sources", sources)
         elif filename not in source["filenames"]:
             source["filenames"].append(filename)
-            self._write_manifest(self.manifest_path, "sources", sources)
+        if revision_of is not None:
+            existing_parent = source.get("revision_of")
+            if existing_parent not in (None, revision_of):
+                raise ValueError("This source is already linked to another revision.")
+            source["revision_of"] = revision_of
+            revised_by = sources[revision_of].setdefault("revised_by", [])
+            if source_id not in revised_by:
+                revised_by.append(source_id)
+        self._write_manifest(self.manifest_path, "sources", sources)
 
         if source_id not in jobs:
             jobs[source_id] = {"source_id": source_id, "status": "queued"}
             self.enqueue(source_id)
         self._write_manifest(self.job_path, "jobs", jobs)
-        return {
+        result = {
             "source_id": source_id,
             "filename": filename,
             "job": jobs[source_id],
             "metadata": source["metadata"],
+        }
+        if isinstance(source.get("revision_of"), str):
+            result["revision_of"] = source["revision_of"]
+        return result
+
+    def set_authoritative_metadata(
+        self, source_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        sources = self._read_manifest(self.manifest_path, "sources")
+        source = sources.get(source_id)
+        if source is None:
+            raise KeyError(source_id)
+        source["metadata"]["authoritative"] = metadata
+        self._write_manifest(self.manifest_path, "sources", sources)
+        return source
+
+    @staticmethod
+    def normalise_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        title = metadata.get("title")
+        authors = metadata.get("authors")
+        year = metadata.get("year")
+        doi = metadata.get("doi")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("Metadata needs a non-empty title.")
+        if not isinstance(authors, list) or not all(
+            isinstance(author, str) and author.strip() for author in authors
+        ):
+            raise ValueError("Metadata authors must be a list of non-empty names.")
+        if year is not None and (
+            not isinstance(year, int) or isinstance(year, bool) or not 1000 <= year <= 9999
+        ):
+            raise ValueError("Metadata year must be a four-digit year or null.")
+        if doi is not None and (not isinstance(doi, str) or not doi.strip()):
+            raise ValueError("Metadata DOI must be a non-empty string or null.")
+        return {
+            "title": title.strip(),
+            "authors": [author.strip() for author in authors],
+            "year": year,
+            "doi": doi.strip() if isinstance(doi, str) else None,
         }
 
     def sources(self) -> list[dict[str, Any]]:
@@ -789,6 +841,7 @@ class AtomicWikiPublisher:
                         "operation": "ingest",
                         "source_id": source_id,
                         "metadata": self._effective_metadata(source),
+                        "revision_of": source.get("revision_of"),
                         "derivative_path": str(derivative_path),
                         "staged_vault": str(stage),
                         "evidence_is_untrusted": True,
@@ -801,7 +854,12 @@ class AtomicWikiPublisher:
             )
             self.codex.ingest(request_path)
             request_path.unlink(missing_ok=True)
-            self._validate(stage, source_id, derivative_path)
+            self._validate(
+                stage,
+                source_id,
+                derivative_path,
+                revision_of=source.get("revision_of"),
+            )
             self._commit(stage, source_id)
             if self._head(self.vault) != base_head:
                 raise PublicationRejected(
@@ -812,6 +870,88 @@ class AtomicWikiPublisher:
             if stage.exists():
                 shutil.rmtree(stage)
             raise
+
+    def publish_metadata_correction(
+        self, source_id: str, metadata: dict[str, Any]
+    ) -> None:
+        """Atomically publish a researcher-authoritative bibliographic correction."""
+
+        source = self.sources.source(source_id)
+        job = self.sources.job(source_id)
+        if source is None or job is None:
+            raise PublicationRejected("The source disappeared before metadata correction.")
+        derivative = job.get("derivative")
+        if not job.get("published") or not isinstance(derivative, str):
+            raise PublicationRejected("Only an ingested source can have its metadata corrected.")
+        derivative_path = self.sources.source_dir.parent / derivative
+        base_head = self._head(self.vault)
+        stage = self._copy_fixed_snapshot()
+        try:
+            self._apply_metadata_correction(stage, source_id, metadata)
+            self._validate(
+                stage,
+                source_id,
+                derivative_path,
+                revision_of=source.get("revision_of"),
+            )
+            self._commit(stage, source_id, operation="metadata correction")
+            if self._head(self.vault) != base_head:
+                raise PublicationRejected(
+                    "The live wiki changed while metadata correction was staged."
+                )
+            self._replace_live_vault(stage)
+        except Exception:
+            if stage.exists():
+                shutil.rmtree(stage)
+            raise
+
+    def _apply_metadata_correction(
+        self, stage: Path, source_id: str, metadata: dict[str, Any]
+    ) -> None:
+        page_path = stage / self.page_prefix / f"{source_id}.md"
+        if not page_path.exists():
+            raise PublicationRejected("The ingested source has no published paper page.")
+        contents = page_path.read_text(encoding="utf-8")
+        citation = f"source-{source_id[:12]}-p1"
+        title = metadata["title"]
+        authors = "; ".join(metadata["authors"]) or "Not specified"
+        year = str(metadata["year"]) if metadata["year"] is not None else "Not specified"
+        doi = metadata["doi"] or "Not specified"
+        contents = re.sub(
+            r"(?m)^title: .+$", f"title: {json.dumps(title)}", contents, count=1
+        )
+        contents = re.sub(r"(?m)^# .+$", f"# {title}", contents, count=1)
+        bibliography = (
+            "## Bibliographic metadata\n"
+            f"Title: {title} [^{citation}]\n"
+            f"Authors: {authors} [^{citation}]\n"
+            f"Year: {year} [^{citation}]\n"
+            f"DOI: {doi} [^{citation}]\n"
+        )
+        contents = re.sub(
+            r"## Bibliographic metadata\n.*?(?=\n## Summary)",
+            bibliography,
+            contents,
+            flags=re.DOTALL,
+        )
+        page_path.write_text(contents, encoding="utf-8")
+        paper_link = f"[[papers/{source_id}]]"
+        index_path = stage / "index.md"
+        index = index_path.read_text(encoding="utf-8")
+        index_path.write_text(
+            re.sub(
+                rf"(?m)^- \[\[papers/{source_id}\]\] — .*$",
+                f"- {paper_link} — {title}",
+                index,
+            ),
+            encoding="utf-8",
+        )
+        with (stage / "log.md").open("a", encoding="utf-8") as log:
+            log.write(
+                f"\n## [2026-07-26] metadata correction | {title}\n"
+                f"Source: {source_id}\nAffected pages: {paper_link}\n"
+                "Contradictions: none\nPossible duplicates: none\nOutcome: published\n"
+            )
 
     def _copy_fixed_snapshot(self) -> Path:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -882,7 +1022,7 @@ class AtomicWikiPublisher:
         )
         return result.stdout.strip() if result.returncode == 0 else None
 
-    def _commit(self, stage: Path, source_id: str) -> None:
+    def _commit(self, stage: Path, source_id: str, *, operation: str = "ingest") -> None:
         if not self._run_git(stage, "diff", "--cached", "--name-only"):
             raise PublicationRejected("Codex produced no wiki update to publish.")
         self._run_git(
@@ -893,10 +1033,17 @@ class AtomicWikiPublisher:
             "user.email=researchos@local.invalid",
             "commit",
             "-m",
-            f"ingest: {source_id}",
+            f"{operation}: {source_id}",
         )
 
-    def _validate(self, stage: Path, source_id: str, derivative_path: Path) -> None:
+    def _validate(
+        self,
+        stage: Path,
+        source_id: str,
+        derivative_path: Path,
+        *,
+        revision_of: str | None = None,
+    ) -> None:
         self._validate_annotations(stage)
         self._validate_historical_citations(stage)
         paper_pages = list((stage / self.page_prefix).glob("*.md"))
@@ -917,6 +1064,8 @@ class AtomicWikiPublisher:
         for topic_path in topic_pages:
             self._validate_topic_page(topic_path, citation_pages)
         self._validate_wikilinks(stage, pages)
+        if revision_of is not None:
+            self._validate_revision_links(stage, source_id, revision_of)
         # Rebuild the proposed index ourselves before looking at it. A writer may
         # have staged files already; inspecting only untracked paths would let a
         # staged PDF or manifest bypass this gate.
@@ -932,6 +1081,22 @@ class AtomicWikiPublisher:
         prohibited = (".pdf", "derivative", "manifest", "ingest-job", "research-thread")
         if any(part in tracked_names.lower() for part in prohibited):
             raise PublicationRejected("Source artifacts cannot enter wiki Git history.")
+
+    def _validate_revision_links(
+        self, stage: Path, source_id: str, revision_of: str | None
+    ) -> None:
+        if not isinstance(revision_of, str) or not re.fullmatch(r"[0-9a-f]{64}", revision_of):
+            raise PublicationRejected("The staged revision has an invalid prior source identity.")
+        revision_page = stage / self.page_prefix / f"{source_id}.md"
+        prior_page = stage / self.page_prefix / f"{revision_of}.md"
+        if not prior_page.exists():
+            raise PublicationRejected("The staged revision is missing its prior paper page.")
+        revision_link = f"[[papers/{revision_of}"
+        prior_link = f"[[papers/{source_id}"
+        if revision_link not in revision_page.read_text(encoding="utf-8"):
+            raise PublicationRejected("The staged revision does not link to its prior paper page.")
+        if prior_link not in prior_page.read_text(encoding="utf-8"):
+            raise PublicationRejected("The staged prior paper does not link to its revision.")
 
     def _validate_annotations(self, stage: Path) -> None:
         if not self.vault.exists():
@@ -974,15 +1139,23 @@ class AtomicWikiPublisher:
     @staticmethod
     def _citation_history(contents: str) -> tuple[Counter[str], Counter[str]]:
         definitions = Counter(
-            re.findall(r"^\[\^[^]]+\]: .+$", contents, flags=re.MULTILINE)
+            f"{note_id}:{source}:{page}"
+            for note_id, source, page in re.findall(
+                r"^\[\^([^]]+)\]: .+? — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
+                contents,
+                flags=re.MULTILINE,
+            )
         )
-        citation_ids = {
-            note_id for note_id in re.findall(r"^\[\^([^]]+)\]: .+$", contents, flags=re.MULTILINE)
-        }
+        citation_ids = {definition.split(":", 1)[0] for definition in definitions}
+        bibliography = re.search(
+            r"## Bibliographic metadata\n.*?(?=\n## |\Z)", contents, flags=re.DOTALL
+        )
+        bibliography_lines = set(bibliography.group(0).splitlines()) if bibliography else set()
         contexts = Counter(
             line
             for line in contents.splitlines()
             if not line.startswith("[^")
+            and line not in bibliography_lines
             and any(f"[^{note_id}]" in line for note_id in citation_ids)
         )
         return definitions, contexts
@@ -1621,6 +1794,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def library() -> HTMLResponse:
         def render_source(source: dict[str, Any]) -> str:
             job = source["job"]
+            metadata = source["metadata"]
+            effective_metadata = AtomicWikiPublisher._effective_metadata(source)
             error = f" — {escape(job['error'])}" if job.get("error") else ""
             paper_link = ""
             if job.get("published"):
@@ -1634,10 +1809,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f'<form action="/library/ingests/{escape(source["source_id"])}/retry" '
                     'method="post"><button>Retry ingest</button></form>'
                 )
+            metadata_state = (
+                "authoritative metadata"
+                if metadata.get("authoritative") is not None
+                else "locally extracted metadata"
+            )
+            revision = (
+                f" — revision of <code>{escape(source['revision_of'])}</code>"
+                if isinstance(source.get("revision_of"), str)
+                else ""
+            )
+            correction = ""
+            if job.get("published"):
+                authors = "; ".join(effective_metadata["authors"])
+                year = "" if effective_metadata["year"] is None else str(effective_metadata["year"])
+                doi = effective_metadata["doi"] or ""
+                correction = (
+                    f'<form action="/library/sources/{escape(source["source_id"])}/metadata" '
+                    'method="post"><label>Title <input name="title" required value="'
+                    f'{escape(effective_metadata["title"], quote=True)}"></label> '
+                    '<label>Authors <input name="authors" value="'
+                    f'{escape(authors, quote=True)}"></label> '
+                    '<label>Year <input name="year" value="'
+                    f'{escape(year, quote=True)}"></label> '
+                    '<label>DOI <input name="doi" value="'
+                    f'{escape(doi, quote=True)}"></label> '
+                    '<button>Save authoritative metadata</button></form>'
+                )
             return (
                 f"<li><code>{escape(source['source_id'])}</code> — "
-                f"{escape(source['metadata']['extracted']['title'])} "
-                f"(<strong>{escape(job['status'])}</strong>){error}{paper_link}{retry}</li>"
+                f"{escape(effective_metadata['title'])} "
+                f"(<strong>{escape(job['status'])}</strong>; {metadata_state})"
+                f"{revision}{error}{paper_link}{retry}{correction}</li>"
             )
 
         entries = "".join(render_source(source) for source in sources.sources())
@@ -1646,28 +1849,75 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Library",
             f"""{library_entries}<form action="/library/sources" method="post" enctype="multipart/form-data">
 <label>PDF <input name="file" type="file" accept="application/pdf,.pdf" required></label>
+<label>Revision of source identity (optional) <input name="revision_of"></label>
 <button>Upload PDF</button></form>""",
         )
 
     @app.post("/library/sources")
-    async def upload_from_library(file: UploadFile = File()) -> RedirectResponse:
+    async def upload_from_library(
+        file: UploadFile = File(), revision_of: str | None = Form(default=None)
+    ) -> RedirectResponse:
         filename = file.filename or "uploaded.pdf"
         content = await file.read()
         validate_pdf_upload(filename, content)
-        sources.upload(filename, content)
+        try:
+            sources.upload(filename, content, revision_of=revision_of or None)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown source revision.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if settings.run_ingest_service:
             ingest_service.schedule()
         return RedirectResponse("/library", status_code=303)
 
     @app.post("/api/sources", status_code=status.HTTP_201_CREATED)
-    async def upload_source(file: UploadFile = File()) -> dict[str, Any]:
+    async def upload_source(
+        file: UploadFile = File(), revision_of: str | None = Form(default=None)
+    ) -> dict[str, Any]:
         filename = file.filename or "uploaded.pdf"
         content = await file.read()
         validate_pdf_upload(filename, content)
-        result = sources.upload(filename, content)
+        try:
+            result = sources.upload(filename, content, revision_of=revision_of or None)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown source revision.") from error
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if settings.run_ingest_service:
             ingest_service.schedule()
         return result
+
+    @app.put("/api/sources/{source_id}/metadata")
+    def correct_source_metadata(source_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        try:
+            authoritative = SourceCatalog.normalise_metadata(metadata)
+            publisher.publish_metadata_correction(source_id, authoritative)
+            source = sources.set_authoritative_metadata(source_id, authoritative)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="Unknown source.") from error
+        except (PublicationRejected, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return {"source_id": source_id, "metadata": source["metadata"]}
+
+    @app.post("/library/sources/{source_id}/metadata")
+    def correct_source_metadata_from_library(
+        source_id: str,
+        title: str = Form(),
+        authors: str = Form(default=""),
+        year: str = Form(default=""),
+        doi: str = Form(default=""),
+    ) -> RedirectResponse:
+        try:
+            metadata = {
+                "title": title,
+                "authors": [author.strip() for author in authors.split(";") if author.strip()],
+                "year": int(year) if year.strip() else None,
+                "doi": doi.strip() or None,
+            }
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Metadata year must be a number.") from error
+        correct_source_metadata(source_id, metadata)
+        return RedirectResponse("/library", status_code=303)
 
     @app.post("/api/ingests/run")
     def run_next_ingest() -> dict[str, Any]:
