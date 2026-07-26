@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 
 
 def outcome_direction(text: str) -> str | None:
@@ -231,7 +232,7 @@ def main() -> int:
     if mode == "malformed":
         print("not-json")
         return 0
-    if mode not in {"success", "invalid", "annotation", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "withdrawn-hidden", "file-invalid", "file-annotation", "file-corrupt-existing"}:
+    if mode not in {"success", "invalid", "annotation", "annotation-ambiguous", "annotation-trailing-newline", "wait-for-concurrent-commit", "artifact", "network", "drop-history", "missing-revision-link", "prompt-write", "result-failure", "web", "withdrawn-hidden", "file-invalid", "file-annotation", "file-corrupt-existing"}:
         print("unsupported fake Codex mode", file=sys.stderr)
         return 64
     if sys.argv[1:] == ["probe"]:
@@ -562,10 +563,34 @@ This substantive method topic accumulates evidence from two sources without coll
                     )
                 )
                 break
+    if mode == "annotation-ambiguous":
+        for filename in os.listdir(page_directory):
+            if filename != f"{source_id}.md" and filename.endswith(".md"):
+                path = os.path.join(page_directory, filename)
+                with open(path, "a", encoding="utf-8") as page_file:
+                    page_file.write(
+                        "\n## Researcher annotations\n"
+                        "<!-- researcher-annotations:start -->\n"
+                        "<!-- researcher-annotations:end -->\n"
+                )
+                break
+    if mode == "annotation-trailing-newline":
+        for filename in os.listdir(page_directory):
+            if filename != f"{source_id}.md" and filename.endswith(".md"):
+                path = os.path.join(page_directory, filename)
+                contents = open(path, encoding="utf-8").read()
+                open(path, "w", encoding="utf-8").write(
+                    contents.replace("<!-- researcher-annotations:end -->\n", "<!-- researcher-annotations:end -->\n\n")
+                )
+                break
     if mode == "artifact":
         artifact = os.path.join(vault, "source.pdf")
         open(artifact, "wb").write(b"not a permitted wiki artifact")
         subprocess.run(["git", "-C", vault, "add", "source.pdf"], check=True)
+    if mode == "wait-for-concurrent-commit":
+        # The public-boundary tests use this deterministic pause to emulate an
+        # Obsidian save after the writer captured its snapshot.
+        time.sleep(0.5)
     print(json.dumps({"type": "progress", "message": "Writing staged paper page"}))
     print(json.dumps({"type": "result", "output": "staged ingest complete"}))
     return 0

@@ -18,7 +18,7 @@ import sys
 import tempfile
 from threading import Event, Lock, Thread
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -671,14 +671,24 @@ class IngestWorker:
                 self.sources.save_jobs(jobs)
                 self.sources.dequeue(source_id)
                 return job
-            except (CodexProtocolError, PublicationRejected):
+            except ConcurrentPublicationRejected as error:
+                job.update({
+                    "source_id": source_id,
+                    "status": "failed",
+                    "attempts": attempts,
+                    "error": str(error),
+                })
+                self.sources.save_jobs(jobs)
+                self.sources.dequeue(source_id)
+                return job
+            except (CodexProtocolError, PublicationRejected) as error:
                 if attempts < 2:
                     continue
                 job.update({
                     "source_id": source_id,
                     "status": "failed",
                     "attempts": attempts,
-                    "error": "Wiki publication failed after one automatic retry.",
+                    "error": str(error) or "Wiki publication failed after one automatic retry.",
                 })
                 self.sources.save_jobs(jobs)
                 self.sources.dequeue(source_id)
@@ -1149,6 +1159,10 @@ class PublicationRejected(Exception):
     """A staged wiki result does not satisfy durable publication invariants."""
 
 
+class ConcurrentPublicationRejected(PublicationRejected):
+    """A writer can safely be retried only after a researcher resolves the conflict."""
+
+
 def filed_analysis_path(title: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-")
     if not slug:
@@ -1205,11 +1219,16 @@ class AtomicWikiPublisher:
                 revision_of=source.get("revision_of"),
             )
             self._commit(stage, source_id)
-            if self._head(self.vault) != base_head:
-                raise PublicationRejected(
-                    "The live wiki changed while this ingest was staged."
-                )
-            self._replace_live_vault(stage)
+            self._rebase_revalidate_and_publish(
+                stage,
+                base_head,
+                lambda: self._validate(
+                    stage,
+                    source_id,
+                    derivative_path,
+                    revision_of=source.get("revision_of"),
+                ),
+            )
         except Exception:
             if stage.exists():
                 shutil.rmtree(stage)
@@ -1239,11 +1258,16 @@ class AtomicWikiPublisher:
                 revision_of=source.get("revision_of"),
             )
             self._commit(stage, source_id, operation="metadata correction")
-            if self._head(self.vault) != base_head:
-                raise PublicationRejected(
-                    "The live wiki changed while metadata correction was staged."
-                )
-            self._replace_live_vault(stage)
+            self._rebase_revalidate_and_publish(
+                stage,
+                base_head,
+                lambda: self._validate(
+                    stage,
+                    source_id,
+                    derivative_path,
+                    revision_of=source.get("revision_of"),
+                ),
+            )
         except Exception:
             if stage.exists():
                 shutil.rmtree(stage)
@@ -1268,11 +1292,11 @@ class AtomicWikiPublisher:
                 raise PublicationRejected("The ingested source has no published evidence to mark.")
             self._validate_withdrawal(stage, source_id, affected_pages)
             self._commit(stage, source_id, operation="withdrawal")
-            if self._head(self.vault) != base_head:
-                raise PublicationRejected(
-                    "The live wiki changed while withdrawal was staged."
-                )
-            self._replace_live_vault(stage)
+            self._rebase_revalidate_and_publish(
+                stage,
+                base_head,
+                lambda: self._validate_withdrawal(stage, source_id, affected_pages),
+            )
         except Exception:
             if stage.exists():
                 shutil.rmtree(stage)
@@ -1352,11 +1376,13 @@ class AtomicWikiPublisher:
             request_path.unlink(missing_ok=True)
             self._validate_filed_analysis(stage, title, analysis_path, unique_source_ids)
             self._commit(stage, analysis_path, operation="filed analysis")
-            if self._head(self.vault) != base_head:
-                raise PublicationRejected(
-                    "The live wiki changed while the analysis was staged."
-                )
-            self._replace_live_vault(stage)
+            self._rebase_revalidate_and_publish(
+                stage,
+                base_head,
+                lambda: self._validate_filed_analysis(
+                    stage, title, analysis_path, unique_source_ids
+                ),
+            )
         except Exception:
             if stage.exists():
                 shutil.rmtree(stage)
@@ -1495,7 +1521,7 @@ class AtomicWikiPublisher:
         self._run_git(stage, "add", "--all")
         changed_pages = [
             stage / name
-            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            for name in self._changed_paths(stage)
             if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/", "analyses/"))
             and name.endswith(".md")
         ]
@@ -1532,28 +1558,89 @@ class AtomicWikiPublisher:
             (stage / "log.md").write_text("# ResearchOS activity log\n", encoding="utf-8")
         return stage
 
-    def _replace_live_vault(self, stage: Path) -> None:
+    def _replace_live_vault(
+        self, stage: Path, *, expected_head: str | None = None
+    ) -> None:
         """Publish through one atomic vault-pointer replacement.
 
         Each committed snapshot is immutable once placed under runtime storage. The
         stable `vault` path is a symlink, so readers observe either the old complete
         snapshot or the new complete snapshot even if this process is interrupted.
         """
-        self.vault.parent.mkdir(parents=True, exist_ok=True)
-        revisions = self.runtime_dir / "vault-revisions"
-        revisions.mkdir(parents=True, exist_ok=True)
-        revision = revisions / self._head(stage)
-        if revision.exists():
-            raise PublicationRejected("The staged vault commit already has a snapshot.")
-        stage.replace(revision)
-        pointer = self.runtime_dir / f".vault-pointer-{uuid4().hex}"
-        pointer.symlink_to(revision.resolve())
-        if self.vault.exists() and not self.vault.is_symlink():
-            pointer.unlink()
-            raise PublicationRejected(
-                "The legacy vault directory cannot be atomically replaced."
+        lock_path: Path | None = None
+        lock_descriptor: int | None = None
+        if expected_head is not None:
+            head_ref = self._run_git(self.vault, "symbolic-ref", "-q", "HEAD")
+            lock_path = self.vault / ".git" / f"{head_ref}.lock"
+            try:
+                lock_descriptor = os.open(
+                    lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+            except FileExistsError as error:
+                raise ConcurrentPublicationRejected(
+                    "The wiki is receiving a concurrent commit; retry the update."
+                ) from error
+        try:
+            if expected_head is not None and self._head(self.vault) != expected_head:
+                raise ConcurrentPublicationRejected(
+                    "The wiki changed before publication; retry the update."
+                )
+            self.vault.parent.mkdir(parents=True, exist_ok=True)
+            revisions = self.runtime_dir / "vault-revisions"
+            revisions.mkdir(parents=True, exist_ok=True)
+            revision = revisions / self._head(stage)
+            if revision.exists():
+                raise PublicationRejected("The staged vault commit already has a snapshot.")
+            stage.replace(revision)
+            pointer = self.runtime_dir / f".vault-pointer-{uuid4().hex}"
+            pointer.symlink_to(revision.resolve())
+            if self.vault.exists() and not self.vault.is_symlink():
+                pointer.unlink()
+                raise PublicationRejected(
+                    "The legacy vault directory cannot be atomically replaced."
+                )
+            pointer.replace(self.vault)
+        finally:
+            if lock_descriptor is not None:
+                os.close(lock_descriptor)
+            if lock_path is not None:
+                lock_path.unlink(missing_ok=True)
+
+    def _rebase_revalidate_and_publish(
+        self,
+        stage: Path,
+        base_head: str | None,
+        revalidate: Callable[[], None],
+    ) -> None:
+        """Move a completed writer commit onto a concurrent researcher commit.
+
+        The writer always starts from one fixed snapshot.  A vault commit made by
+        Obsidian while it works must become the parent of the writer's one final
+        commit, rather than being overwritten by the staged snapshot.
+        """
+
+        current_head = self._head(self.vault)
+        if current_head == base_head:
+            self._replace_live_vault(stage, expected_head=base_head)
+            return
+        if base_head is None or current_head is None:
+            raise ConcurrentPublicationRejected(
+                "The wiki changed before this update could be rebased; retry the update."
             )
-        pointer.replace(self.vault)
+        try:
+            self._run_git(stage, "rebase", "--onto", current_head, base_head)
+        except PublicationRejected as error:
+            subprocess.run(
+                ["git", "-C", str(stage), "rebase", "--abort"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            raise ConcurrentPublicationRejected(
+                "The wiki changed concurrently and the update could not be rebased; retry after resolving the page conflict."
+            ) from error
+        revalidate()
+        self._replace_live_vault(stage, expected_head=current_head)
 
     @staticmethod
     def _effective_metadata(source: dict[str, Any]) -> dict[str, Any]:
@@ -1600,6 +1687,15 @@ class AtomicWikiPublisher:
             f"{operation}: {source_id}",
         )
 
+    def _changed_paths(self, stage: Path) -> list[str]:
+        """Return this writer's paths both before and after a rebase commit."""
+
+        staged = self._run_git(stage, "diff", "--cached", "--name-only")
+        if staged:
+            return staged.splitlines()
+        parent = self._run_git(stage, "rev-parse", "--verify", "HEAD^")
+        return self._run_git(stage, "diff", "--name-only", parent, "HEAD").splitlines()
+
     def _validate(
         self,
         stage: Path,
@@ -1636,7 +1732,7 @@ class AtomicWikiPublisher:
         self._run_git(stage, "add", "--all")
         changed_pages = [
             stage / name
-            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            for name in self._changed_paths(stage)
             if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/"))
             and name.endswith(".md")
         ]
@@ -1675,7 +1771,7 @@ class AtomicWikiPublisher:
         self._run_git(stage, "add", "--all")
         changed_pages = [
             stage / name
-            for name in self._run_git(stage, "diff", "--cached", "--name-only").splitlines()
+            for name in self._changed_paths(stage)
             if name.startswith((f"{self.page_prefix}/", f"{self.topic_prefix}/", "analyses/"))
             and name.endswith(".md")
         ]
@@ -1832,18 +1928,27 @@ class AtomicWikiPublisher:
             raise PublicationRejected("The staged prior paper does not link to its revision.")
 
     def _validate_annotations(self, stage: Path) -> None:
+        """Require one final protected section and preserve it as literal bytes."""
+
+        for page in self._wiki_pages(stage):
+            self._annotation_bytes(page.read_bytes())
         if not self.vault.exists():
             return
-        for old_page in self.vault.rglob("*.md"):
-            if ".git" in old_page.parts:
-                continue
+        for old_page in self._wiki_pages(self.vault):
             staged_page = stage / old_page.relative_to(self.vault)
             if not staged_page.exists():
                 raise PublicationRejected("The staged writer removed a protected wiki page.")
-            if self._annotation_bytes(old_page.read_text(encoding="utf-8")) != self._annotation_bytes(
-                staged_page.read_text(encoding="utf-8")
+            if self._annotation_bytes(old_page.read_bytes()) != self._annotation_bytes(
+                staged_page.read_bytes()
             ):
                 raise PublicationRejected("The staged writer modified researcher annotations.")
+
+    def _wiki_pages(self, vault: Path) -> list[Path]:
+        return [
+            page
+            for prefix in (self.page_prefix, self.topic_prefix, "analyses")
+            for page in (vault / prefix).glob("*.md")
+        ]
 
     def _validate_historical_citations(self, stage: Path) -> None:
         """Keep existing cited evidence and its claim context during revisions."""
@@ -1871,6 +1976,7 @@ class AtomicWikiPublisher:
 
     @staticmethod
     def _citation_history(contents: str) -> tuple[Counter[str], Counter[str]]:
+        contents = AtomicWikiPublisher._managed_contents(contents)
         definitions = Counter(
             f"{note_id}:{source}:{page}"
             for note_id, source, page in re.findall(
@@ -1894,13 +2000,36 @@ class AtomicWikiPublisher:
         return definitions, contexts
 
     @staticmethod
-    def _annotation_bytes(contents: str) -> str:
-        match = re.search(
-            r"## Researcher annotations\n<!-- researcher-annotations:start -->.*?<!-- researcher-annotations:end -->",
+    def _managed_contents(contents: str) -> str:
+        """Exclude researcher-owned bytes from every AI-managed validation rule."""
+
+        return re.sub(
+            r"\n?## Researcher annotations\r?\n"
+            r"<!-- researcher-annotations:start -->.*?"
+            r"<!-- researcher-annotations:end -->\r?\n?\Z",
+            "\n",
             contents,
             flags=re.DOTALL,
         )
-        return match.group(0) if match else ""
+
+    @staticmethod
+    def _annotation_bytes(contents: bytes) -> bytes:
+        start_pattern = re.compile(
+            rb"## Researcher annotations\r?\n<!-- researcher-annotations:start -->"
+        )
+        end_pattern = re.compile(rb"<!-- researcher-annotations:end -->")
+        starts = list(start_pattern.finditer(contents))
+        ends = list(end_pattern.finditer(contents))
+        if len(starts) != 1 or len(ends) != 1 or ends[0].start() < starts[0].end():
+            raise PublicationRejected(
+                "A wiki page has ambiguous researcher-annotation boundaries."
+            )
+        trailing_newlines = contents[ends[0].end() :]
+        if trailing_newlines.strip(b"\r\n"):
+            raise PublicationRejected(
+                "The researcher-annotation section must be the final page section."
+            )
+        return contents[starts[0].start() : ends[0].end()] + trailing_newlines
 
     def _citation_pages(self, source_id: str, derivative_path: Path) -> dict[str, set[int]]:
         paths = {source_id: derivative_path}
@@ -1971,7 +2100,9 @@ class AtomicWikiPublisher:
         *,
         required_source: str | None = None,
     ) -> None:
-        contents = page_path.read_text(encoding="utf-8")
+        contents = AtomicWikiPublisher._managed_contents(
+            page_path.read_text(encoding="utf-8")
+        )
         footnotes = re.findall(
             r"^\[\^([^]]+)\]: (.+?) — source ([0-9a-f]{64}) — PDF p\. (\d+)\s*$",
             contents,
@@ -2078,7 +2209,7 @@ class AtomicWikiPublisher:
 
     def _validate_wikilinks(self, stage: Path, pages: list[Path]) -> None:
         for page_path in pages:
-            contents = page_path.read_text(encoding="utf-8")
+            contents = self._managed_contents(page_path.read_text(encoding="utf-8"))
             links = re.findall(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]", contents)
             if not links and "possible_duplicates: []" not in contents:
                 raise PublicationRejected(
