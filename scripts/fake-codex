@@ -66,6 +66,8 @@ def main() -> int:
             return 68
     page_directory = os.path.join(vault, "papers")
     os.makedirs(page_directory, exist_ok=True)
+    topic_directory = os.path.join(vault, "topics")
+    os.makedirs(topic_directory, exist_ok=True)
     citation = f"source-{source_id[:12]}-p1"
     page = f'''---
 page_type: paper
@@ -98,7 +100,7 @@ Dataset details remain limited to the cited paper. [^{citation}]
 The paper's limitations require cautious interpretation. [^{citation}]
 
 ## Related pages
-No related pages yet.
+[[topics/research-methods|Research methods]] [^{citation}]
 
 ## Contradictions and open questions
 No contradictions identified.
@@ -111,8 +113,35 @@ No contradictions identified.
 <!-- researcher-annotations:end -->
 '''
     open(os.path.join(page_directory, f"{source_id}.md"), "w", encoding="utf-8").write(page)
+    topic_path = os.path.join(topic_directory, "research-methods.md")
+    if not os.path.exists(topic_path):
+        topic = f'''---
+page_type: topic
+id: topic-research-methods
+title: "Research methods"
+aliases: []
+supporting_sources:
+  - {source_id}
+created: 2026-07-26
+possible_duplicates: []
+---
+# Research methods
+
+## Summary
+Research methods are maintained as explicit wiki knowledge. [^{citation}]
+
+## Evidence citations
+[^{citation}]: {title} — source {source_id} — PDF p. 1
+
+## Researcher annotations
+<!-- researcher-annotations:start -->
+<!-- researcher-annotations:end -->
+'''
+        open(topic_path, "w", encoding="utf-8").write(topic)
     with open(os.path.join(vault, "index.md"), "a", encoding="utf-8") as index:
         index.write(f"- [[papers/{source_id}]] — {title}\n")
+        if "[[topics/research-methods]]" not in open(os.path.join(vault, "index.md"), encoding="utf-8").read():
+            index.write("- [[topics/research-methods]] — Research methods\n")
     with open(os.path.join(vault, "log.md"), "a", encoding="utf-8") as log:
         log.write(
             f"\n## [2026-07-26] ingest | {title}\n"

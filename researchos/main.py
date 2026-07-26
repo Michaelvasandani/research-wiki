@@ -18,6 +18,7 @@ import tempfile
 from threading import Event, Lock, Thread
 import time
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
@@ -1097,6 +1098,263 @@ def page(title: str, content: str) -> HTMLResponse:
     )
 
 
+@dataclass(frozen=True)
+class PublishedWikiPage:
+    """A Markdown page addressed within the currently published vault snapshot."""
+
+    path: str
+    contents: str
+    metadata: dict[str, str | list[str]]
+    body: str
+
+    @property
+    def title(self) -> str:
+        title = self.metadata.get("title")
+        return title if isinstance(title, str) and title else self.path.rsplit("/", 1)[-1]
+
+    @property
+    def page_type(self) -> str:
+        page_type = self.metadata.get("page_type")
+        return page_type if isinstance(page_type, str) and page_type else "wiki"
+
+
+class PublishedWiki:
+    """Read-only view of the one fully published vault snapshot."""
+
+    ignored_paths = {"AGENTS.md", "index.md", "log.md"}
+
+    def __init__(self, vault: Path) -> None:
+        # `vault` is an atomically replaced symlink. Resolve it once so a single
+        # request reads one immutable revision even if a later publish swaps the
+        # live pointer while this view is rendering.
+        self.vault = vault.resolve() if vault.exists() else vault
+        self.pages = self._load_pages()
+        self.by_path = {wiki_page.path: wiki_page for wiki_page in self.pages}
+
+    def page(self, path: str) -> PublishedWikiPage | None:
+        return self.by_path.get(self._normalise_path(path))
+
+    def link_target(self, target: str) -> PublishedWikiPage | None:
+        return self.page(target)
+
+    def backlinks(self, page: PublishedWikiPage) -> list[PublishedWikiPage]:
+        return [
+            candidate
+            for candidate in self.pages
+            if candidate.path != page.path
+            and page.path in extract_wikilinks(candidate.body)
+        ]
+
+    def search(self, query: str) -> list[PublishedWikiPage]:
+        needle = query.casefold().strip()
+        if not needle:
+            return []
+        return [
+            wiki_page
+            for wiki_page in self.pages
+            if needle in wiki_page.contents.casefold()
+        ]
+
+    def _load_pages(self) -> list[PublishedWikiPage]:
+        if not self.vault.exists():
+            return []
+        return [
+            self._parse_page(path)
+            for path in sorted(self.vault.rglob("*.md"))
+            if self._is_page(path)
+        ]
+
+    def _is_page(self, path: Path) -> bool:
+        return ".git" not in path.parts and path.relative_to(self.vault).as_posix() not in self.ignored_paths
+
+    def _parse_page(self, path: Path) -> PublishedWikiPage:
+        contents = path.read_text(encoding="utf-8")
+        metadata, body = parse_frontmatter(contents)
+        return PublishedWikiPage(
+            path=path.relative_to(self.vault).with_suffix("").as_posix(),
+            contents=contents,
+            metadata=metadata,
+            body=body,
+        )
+
+    @staticmethod
+    def _normalise_path(path: str) -> str:
+        candidate = path.strip().removesuffix(".md").strip("/")
+        if not candidate or any(part in {"", ".", ".."} for part in candidate.split("/")):
+            return ""
+        return candidate
+
+
+def parse_frontmatter(contents: str) -> tuple[dict[str, str | list[str]], str]:
+    """Parse the MVP's deliberately minimal YAML frontmatter without a YAML service."""
+
+    if not contents.startswith("---\n"):
+        return {}, contents
+    closing = contents.find("\n---\n", 4)
+    if closing == -1:
+        return {}, contents
+    metadata: dict[str, str | list[str]] = {}
+    current_list: list[str] | None = None
+    for raw_line in contents[4:closing].splitlines():
+        if raw_line.startswith("  - ") and current_list is not None:
+            current_list.append(raw_line[4:].strip().strip('"'))
+            continue
+        key, separator, value = raw_line.partition(":")
+        if not separator:
+            current_list = None
+            continue
+        cleaned = value.strip().strip('"')
+        if cleaned == "":
+            current_list = []
+            metadata[key] = current_list
+        elif cleaned == "[]":
+            metadata[key] = []
+            current_list = None
+        else:
+            metadata[key] = cleaned
+            current_list = None
+    return metadata, contents[closing + len("\n---\n") :]
+
+
+WIKILINK_PATTERN = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]")
+FOOTNOTE_PATTERN = re.compile(r"^\[\^([^]]+)\]:\s*(.+)$", flags=re.MULTILINE)
+CITATION_PATTERN = re.compile(
+    r"^(?P<title>.+?) — source (?P<source>[0-9a-f]{64}) — PDF p\. (?P<page>\d+)\s*$"
+)
+
+
+def extract_wikilinks(markdown: str) -> set[str]:
+    return {target.strip().removesuffix(".md") for target in WIKILINK_PATTERN.findall(markdown)}
+
+
+def wiki_href(page_path: str) -> str:
+    return f"/wiki/{quote(page_path, safe='/')}"
+
+
+def render_metadata(metadata: dict[str, str | list[str]]) -> str:
+    useful_fields = (
+        ("page_type", "Page type"),
+        ("id", "Page identity"),
+        ("aliases", "Aliases"),
+        ("supporting_sources", "Supporting sources"),
+        ("created", "Created"),
+        ("possible_duplicates", "Possible duplicates"),
+    )
+    fields = []
+    for key, label in useful_fields:
+        value = metadata.get(key)
+        if value in (None, "", []):
+            continue
+        display = ", ".join(value) if isinstance(value, list) else value
+        fields.append(f"<dt>{escape(label)}</dt><dd>{escape(display)}</dd>")
+    return f"<section><h2>Page metadata</h2><dl>{''.join(fields)}</dl></section>" if fields else ""
+
+
+def render_inline(markdown: str, wiki: PublishedWiki, footnotes: dict[str, str]) -> str:
+    pieces: list[str] = []
+    token = re.compile(r"\[\[([^]|]+)(?:\|([^]]+))?\]\]|\[\^([^]]+)\]")
+    offset = 0
+    for match in token.finditer(markdown):
+        pieces.append(escape(markdown[offset : match.start()]))
+        target, label, note_id = match.groups()
+        if note_id:
+            if note_id in footnotes:
+                pieces.append(
+                    f'<sup><a href="#citation-{escape(note_id)}">[{escape(note_id)}]</a></sup>'
+                )
+            else:
+                pieces.append(escape(match.group(0)))
+        else:
+            linked_page = wiki.link_target(target)
+            display = label or target.rsplit("/", 1)[-1]
+            if linked_page:
+                pieces.append(f'<a href="{wiki_href(linked_page.path)}">{escape(display)}</a>')
+            else:
+                pieces.append(escape(match.group(0)))
+        offset = match.end()
+    pieces.append(escape(markdown[offset:]))
+    return "".join(pieces)
+
+
+def render_citations(footnotes: dict[str, str]) -> str:
+    if not footnotes:
+        return ""
+    citations = []
+    for note_id, citation in footnotes.items():
+        match = CITATION_PATTERN.match(citation)
+        if match:
+            citations.append(
+                f'<li id="citation-{escape(note_id)}"><strong>{escape(match["title"])}</strong> — '
+                f'Source identity <code>{escape(match["source"])}</code> — '
+                f'PDF page {escape(match["page"])}</li>'
+            )
+        else:
+            citations.append(f'<li id="citation-{escape(note_id)}">{escape(citation)}</li>')
+    return f"<ol class=\"citations\">{''.join(citations)}</ol>"
+
+
+def render_markdown(markdown: str, wiki: PublishedWiki) -> str:
+    footnotes = {note_id: text for note_id, text in FOOTNOTE_PATTERN.findall(markdown)}
+    body = FOOTNOTE_PATTERN.sub("", markdown).strip()
+    rendered: list[str] = []
+    paragraph: list[str] = []
+    list_items: list[str] = []
+    rendered_citations = False
+
+    def flush_paragraph() -> None:
+        if paragraph:
+            rendered.append(f"<p>{render_inline(' '.join(paragraph), wiki, footnotes)}</p>")
+            paragraph.clear()
+
+    def flush_list() -> None:
+        if list_items:
+            rendered.append(
+                "<ul>" + "".join(
+                    f"<li>{render_inline(item, wiki, footnotes)}</li>" for item in list_items
+                ) + "</ul>"
+            )
+            list_items.clear()
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            flush_paragraph()
+            flush_list()
+        elif stripped.startswith("<!--") and stripped.endswith("-->"):
+            continue
+        elif heading := re.match(r"^(#{1,3})\s+(.+)$", stripped):
+            flush_paragraph()
+            flush_list()
+            level = min(len(heading.group(1)) + 1, 4)
+            rendered.append(
+                f"<h{level}>{render_inline(heading.group(2), wiki, footnotes)}</h{level}>"
+            )
+            if heading.group(2).casefold() == "evidence citations":
+                rendered.append(render_citations(footnotes))
+                rendered_citations = True
+        elif stripped.startswith("- "):
+            flush_paragraph()
+            list_items.append(stripped[2:])
+        else:
+            flush_list()
+            paragraph.append(stripped)
+    flush_paragraph()
+    flush_list()
+    return "".join(rendered) + ("" if rendered_citations else render_citations(footnotes))
+
+
+def search_excerpt(markdown: str, query: str) -> str:
+    plain = re.sub(r"\[\[([^]|]+)(?:\|([^]]+))?\]\]", r"\2", markdown)
+    plain = re.sub(r"\[\^[^]]+\]", "", plain)
+    compact = " ".join(plain.split())
+    index = compact.casefold().find(query.casefold())
+    if index == -1:
+        return compact[:180]
+    start = max(index - 55, 0)
+    end = min(index + len(query) + 95, len(compact))
+    return ("…" if start else "") + compact[start:end] + ("…" if end < len(compact) else "")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_environment()
     state = FileState(settings.data_dir)
@@ -1228,23 +1486,98 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/wiki", response_class=HTMLResponse)
     def wiki() -> HTMLResponse:
-        paper_dir = publisher.vault / "papers"
-        papers = sorted(paper_dir.glob("*.md")) if paper_dir.exists() else []
-        entries = "".join(
-            f'<li><a href="/wiki/papers/{escape(item.stem)}">{escape(item.stem)}</a></li>'
-            for item in papers
-        )
+        published = PublishedWiki(publisher.vault)
+        grouped: dict[str, list[PublishedWikiPage]] = {"paper": [], "topic": [], "other": []}
+        for wiki_page in published.pages:
+            grouped.get(wiki_page.page_type, grouped["other"]).append(wiki_page)
+
+        def page_list(items: list[PublishedWikiPage]) -> str:
+            if not items:
+                return "<p>None yet.</p>"
+            return "<ul>" + "".join(
+                f'<li><a href="{wiki_href(item.path)}">{escape(item.title)}</a></li>'
+                for item in items
+            ) + "</ul>"
+
         return page(
             "Wiki",
-            f"<ul>{entries}</ul>" if entries else "<p>No published wiki pages.</p>",
+            """<form action="/wiki/search" method="get"><label>Search published wiki
+<input name="q" type="search" required></label><button>Search</button></form>
+<p><a href="/wiki/index">Browse the index</a> · <a href="/wiki/activity">Read activity</a></p>
+<section><h2>Paper pages</h2>"""
+            + page_list(grouped["paper"])
+            + "</section><section><h2>Topic pages</h2>"
+            + page_list(grouped["topic"])
+            + "</section>"
+            + (
+                "<section><h2>Other pages</h2>" + page_list(grouped["other"]) + "</section>"
+                if grouped["other"]
+                else ""
+            ),
         )
 
-    @app.get("/wiki/papers/{source_id}", response_class=HTMLResponse)
-    def paper_page(source_id: str) -> HTMLResponse:
-        paper_path = publisher.vault / "papers" / f"{source_id}.md"
-        if not paper_path.exists():
-            raise HTTPException(status_code=404, detail="Unknown paper page.")
-        return page("Paper page", f"<pre>{escape(paper_path.read_text(encoding='utf-8'))}</pre>")
+    @app.get("/wiki/search", response_class=HTMLResponse)
+    def search_wiki(q: str = "") -> HTMLResponse:
+        published = PublishedWiki(publisher.vault)
+        query = q.strip()
+        matches = published.search(query)
+        entries = "".join(
+            f'<li><a href="{wiki_href(item.path)}">{escape(item.title)}</a>'
+            f" <small>{escape(item.page_type)}</small><p>{escape(search_excerpt(item.body, query))}</p></li>"
+            for item in matches
+        )
+        content = (
+            f'<form action="/wiki/search" method="get"><label>Search published wiki '
+            f'<input name="q" type="search" value="{escape(query)}" required></label>'
+            "<button>Search</button></form>"
+        )
+        if not query:
+            content += "<p>Enter words from a paper or topic page.</p>"
+        elif matches:
+            content += f"<p>{len(matches)} published page(s) match <strong>{escape(query)}</strong>.</p><ul>{entries}</ul>"
+        else:
+            content += f"<p>No published pages match <strong>{escape(query)}</strong>.</p>"
+        return page("Wiki search", content)
+
+    @app.get("/wiki/index", response_class=HTMLResponse)
+    def wiki_index() -> HTMLResponse:
+        published = PublishedWiki(publisher.vault)
+        index_path = published.vault / "index.md"
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="No published wiki index.")
+        return page("Wiki index", render_markdown(index_path.read_text(encoding="utf-8"), published))
+
+    @app.get("/wiki/activity", response_class=HTMLResponse)
+    def wiki_activity() -> HTMLResponse:
+        published = PublishedWiki(publisher.vault)
+        activity_path = published.vault / "log.md"
+        if not activity_path.exists():
+            raise HTTPException(status_code=404, detail="No published wiki activity log.")
+        return page("Wiki activity", render_markdown(activity_path.read_text(encoding="utf-8"), published))
+
+    @app.get("/wiki/{page_path:path}", response_class=HTMLResponse)
+    def wiki_page(page_path: str) -> HTMLResponse:
+        published = PublishedWiki(publisher.vault)
+        current_page = published.page(page_path)
+        if current_page is None:
+            raise HTTPException(status_code=404, detail="Unknown published wiki page.")
+        backlinks = published.backlinks(current_page)
+        backlink_section = (
+            "<section><h2>Backlinks</h2><ul>"
+            + "".join(
+                f'<li><a href="{wiki_href(backlink.path)}">{escape(backlink.title)}</a></li>'
+                for backlink in backlinks
+            )
+            + "</ul></section>"
+            if backlinks
+            else "<section><h2>Backlinks</h2><p>No explicit backlinks.</p></section>"
+        )
+        return page(
+            current_page.title,
+            render_metadata(current_page.metadata)
+            + render_markdown(current_page.body, published)
+            + backlink_section,
+        )
 
     @app.get("/graph", response_class=HTMLResponse)
     def graph() -> HTMLResponse:
