@@ -25,3 +25,9 @@ Run the public-boundary smoke tests locally with:
 python -m pip install -e '.[dev]'
 python -m pytest
 ```
+
+For the complete manual acceptance smoke using an ordinarily authenticated real
+Codex CLI and Obsidian, including the actual writer/chat permission profiles,
+use [the real-Codex smoke guide](docs/manual-real-codex-smoke.md). The guide
+uses the checked-in `scripts/real-codex` protocol adapter; bare `codex` is not
+itself a ResearchOS worker command.

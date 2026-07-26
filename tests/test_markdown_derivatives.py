@@ -103,6 +103,10 @@ def test_fifo_ingest_creates_immutable_page_addressable_derivatives_and_manifest
     }
     assert manifest["configuration"]["network"] == "disabled"
     assert manifest["configuration"]["plugins"] == "disabled"
+    metrics = first_run.json()["job"]["metrics"]
+    assert metrics["conversion_duration_ms"] >= 0
+    assert metrics["derivative_bytes"] == len(derivative.read_bytes())
+    assert metrics["end_to_end_ingest_duration_ms"] >= metrics["conversion_duration_ms"]
     assert manifest["configuration"]["untrusted_pdf"] is True
 
 

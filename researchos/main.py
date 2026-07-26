@@ -632,6 +632,7 @@ class IngestWorker:
         job = jobs[source_id]
         job["status"] = "processing"
         self.sources.save_jobs(jobs)
+        ingest_started = time.monotonic()
         attempts = int(job.get("attempts", 0))
         while True:
             attempts += 1
@@ -639,9 +640,11 @@ class IngestWorker:
             try:
                 if attempts <= self.settings.transient_conversion_failures:
                     raise OSError("Transient local converter failure.")
+                conversion_started = time.monotonic()
                 derivative, manifest = self._convert_with_limits(
                     source_id, self.sources.source_path(source_id).read_bytes()
                 )
+                conversion_duration_ms = (time.monotonic() - conversion_started) * 1000
                 manifest["output_sha256"] = sha256(derivative.encode()).hexdigest()
                 manifest["converted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 manifest["derivative_version"] = self.derivative_version
@@ -656,6 +659,13 @@ class IngestWorker:
                     "derivative": str(markdown_path.relative_to(self.sources.source_dir.parent)),
                     "manifest": str(manifest_path.relative_to(self.sources.source_dir.parent)),
                     "published": True,
+                    "metrics": {
+                        "conversion_duration_ms": round(conversion_duration_ms, 3),
+                        "derivative_bytes": len(derivative.encode("utf-8")),
+                        "end_to_end_ingest_duration_ms": round(
+                            (time.monotonic() - ingest_started) * 1000, 3
+                        ),
+                    },
                 })
                 job.pop("error", None)
                 self.sources.save_jobs(jobs)
@@ -3332,12 +3342,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f'<form action="/library/sources/{escape(source["source_id"])}" '
                     'method="post"><button>Remove pre-ingest upload</button></form>'
                 )
+            metrics = job.get("metrics")
+            metric_summary = ""
+            if isinstance(metrics, dict):
+                conversion = metrics.get("conversion_duration_ms")
+                derivative_bytes = metrics.get("derivative_bytes")
+                end_to_end = metrics.get("end_to_end_ingest_duration_ms")
+                if all(
+                    isinstance(value, (int, float))
+                    for value in (conversion, derivative_bytes, end_to_end)
+                ):
+                    metric_summary = (
+                        "<br><small>Ingest metrics: conversion "
+                        f"{conversion:g} ms; derivative {derivative_bytes:g} bytes; "
+                        f"end-to-end {end_to_end:g} ms.</small>"
+                    )
             return (
                 f"<li><code>{escape(source['source_id'])}</code> — "
                 f"{escape(effective_metadata['title'])} "
                 f"(<strong>{escape(job['status'])}</strong>; {metadata_state})"
                 f"{withdrawal}{revision}{error}{paper_link}{retry}{correction}"
-                f"{withdrawal_form}{remove_form}</li>"
+                f"{withdrawal_form}{remove_form}{metric_summary}</li>"
             )
 
         entries = "".join(render_source(source) for source in sources.sources())
