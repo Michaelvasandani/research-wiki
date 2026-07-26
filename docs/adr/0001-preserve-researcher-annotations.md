@@ -1,0 +1,3 @@
+# Preserve researcher annotations during automatic wiki updates
+
+ResearchOS automatically publishes AI-maintained wiki updates, but the designated researcher-annotation section on each page is protected and preserved byte-for-byte. A vault watcher creates debounced Git commits for edits saved through Obsidian; if an edit lands while Codex is preparing an update, Codex rebases and revalidates before publishing rather than overwriting the annotation. A human edit outside the protected section creates a page conflict and pauses automatic changes to that page until the researcher resolves it, preventing silent loss while retaining a clear AI-managed boundary. This preserves expert judgment without requiring researchers to operate Git.
