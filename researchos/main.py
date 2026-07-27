@@ -48,6 +48,7 @@ class Settings:
     data_dir: Path
     codex_command: tuple[str, ...]
     writer_network_access: bool = False
+    codex_timeout_seconds: int = 300
     codex_environment: dict[str, str] = field(default_factory=dict)
     max_pdf_bytes: int = 20 * 1024 * 1024
     max_pdf_pages: int = 500
@@ -70,6 +71,7 @@ class Settings:
                 os.environ.get("RESEARCHOS_WRITER_NETWORK_ACCESS") == "enabled"
                 or Path(command[0]).name == "real-codex"
             ),
+            codex_timeout_seconds=int(os.environ.get("RESEARCHOS_CODEX_TIMEOUT_SECONDS", "300")),
         )
 
 
@@ -1144,7 +1146,7 @@ class CodexWorker:
                 check=False,
                 env=environment,
                 text=True,
-                timeout=15,
+                timeout=self.settings.codex_timeout_seconds,
             )
         except FileNotFoundError as error:
             raise CodexProtocolError("Codex executable was not found.") from error
