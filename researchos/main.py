@@ -47,6 +47,7 @@ class Settings:
 
     data_dir: Path
     codex_command: tuple[str, ...]
+    writer_network_access: bool = False
     codex_environment: dict[str, str] = field(default_factory=dict)
     max_pdf_bytes: int = 20 * 1024 * 1024
     max_pdf_pages: int = 500
@@ -65,6 +66,10 @@ class Settings:
         return cls(
             data_dir=Path(os.environ.get("RESEARCHOS_DATA_DIR", "data")),
             codex_command=command,
+            writer_network_access=(
+                os.environ.get("RESEARCHOS_WRITER_NETWORK_ACCESS") == "enabled"
+                or Path(command[0]).name == "real-codex"
+            ),
         )
 
 
@@ -933,6 +938,7 @@ class CodexWorker:
     """Production-shaped subprocess boundary for the Codex CLI worker."""
 
     def __init__(self, settings: Settings) -> None:
+        self.settings = settings
         self.command = settings.codex_command
         self.environment = settings.codex_environment
 
@@ -1091,21 +1097,23 @@ class CodexWorker:
     ) -> dict[str, Any]:
         environment = os.environ.copy()
         environment.update(self.environment)
+        writer_egress_enabled = network_disabled and self.settings.writer_network_access
         if network_disabled:
-            # This is both the production worker contract and a deliberately visible
-            # boundary for the deterministic fake.  The writer receives no live-vault
-            # path and no configured HTTP proxy; its only evidence input is the
-            # immutable derivative named in its request file.
+            # The deterministic writer remains offline. Real Codex writers need
+            # outbound access to the hosted Codex service, but still receive only
+            # the staged vault as their working directory.
             environment.update(
                 {
-                    "RESEARCHOS_NETWORK_ACCESS": "disabled",
-                    "HTTP_PROXY": "",
-                    "HTTPS_PROXY": "",
-                    "ALL_PROXY": "",
-                    "NO_PROXY": "*",
+                    "RESEARCHOS_NETWORK_ACCESS": (
+                        "enabled" if writer_egress_enabled else "disabled"
+                    ),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 }
             )
+            if not writer_egress_enabled:
+                environment.update(
+                    {"HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "", "NO_PROXY": "*"}
+                )
         if read_only:
             # Unlike a staged writer, research may eventually use the web, but it
             # never receives a writable filesystem. The application owns only the
@@ -1125,7 +1133,8 @@ class CodexWorker:
         if network_disabled:
             if writable_directory is None:
                 raise CodexProtocolError("The writer sandbox needs a staged vault.")
-            command = self._sandboxed_writer_command(command, writable_directory)
+            if not writer_egress_enabled:
+                command = self._sandboxed_writer_command(command, writable_directory)
         elif read_only:
             command = self._sandboxed_reader_command(command)
         try:
