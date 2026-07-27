@@ -1143,6 +1143,11 @@ class CodexWorker:
             raise CodexProtocolError("Codex did not respond before the timeout.") from error
 
         if result.returncode:
+            detail = " ".join(result.stderr.split())
+            if detail:
+                raise CodexProtocolError(
+                    f"Codex exited with status {result.returncode}: {detail[:500]}"
+                )
             raise CodexProtocolError(f"Codex exited with status {result.returncode}.")
 
         events: list[dict[str, str]] = []

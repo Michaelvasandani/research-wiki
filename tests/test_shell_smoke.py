@@ -69,4 +69,4 @@ def test_public_codex_probe_surfaces_malformed_and_failed_fake_output(tmp_path: 
     assert malformed.status_code == 502
     assert malformed.json()["detail"] == "Codex returned malformed protocol output."
     assert failed.status_code == 502
-    assert failed.json()["detail"] == "Codex exited with status 17."
+    assert failed.json()["detail"] == "Codex exited with status 17: controlled fake failure"

@@ -176,6 +176,20 @@ def test_writer_runs_without_network_access(tmp_path: Path) -> None:
     assert job["status"] == "completed"
 
 
+def test_failed_ingest_preserves_the_worker_failure_detail(tmp_path: Path) -> None:
+    with make_client(tmp_path, fake_mode="failure") as client:
+        _, job = upload_and_run(
+            client,
+            "failed-writer.pdf",
+            text_pdf("The worker failure should be visible to the researcher."),
+        )
+        library = client.get("/library")
+
+    assert job["status"] == "failed"
+    assert "controlled fake failure" in job["error"]
+    assert "controlled fake failure" in library.text
+
+
 def test_relative_data_directory_keeps_the_published_vault_readable(tmp_path: Path) -> None:
     previous_cwd = Path.cwd()
     os.chdir(tmp_path)
