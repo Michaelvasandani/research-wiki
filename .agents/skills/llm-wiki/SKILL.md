@@ -38,7 +38,10 @@ ResearchOS vault. Follow it whenever working with persistent wiki knowledge.
    citations, and a final untouched researcher-annotation section.
 4. Update the content index and append an activity entry naming the source,
    affected pages, contradictions, possible duplicates, and outcome.
-5. Validate citations, links, metadata, index/log changes, annotation
+5. Have an independent reviewer inspect the staged paper against the supplied
+   derivative. The reviewer repairs missing or invalid citations when the
+   evidence supports the claim, and removes or rewrites unsupported claims.
+6. Validate citations, links, metadata, index/log changes, annotation
    boundaries, and Git scope before returning a completed staged result.
 
 ## Query workflow
